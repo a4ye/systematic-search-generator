@@ -5,4 +5,11 @@ description = "Automated literature retrieval tool that compiles high-quality st
 requires-python = ">=3.11"
 dependencies = [
     "biopython>=1.86",
+    "openpyxl>=3.1.0",
+    "openai>=1.0.0",
+    "python-docx>=1.0.0",
+    "tenacity>=8.2.0",
+    "rich>=13.0.0",
+    "python-dotenv>=1.0.0",
+    "pymupdf>=1.24.0",
 ]
