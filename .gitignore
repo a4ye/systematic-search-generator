@@ -2,3 +2,5 @@
 .env
 data
 pubmed-queries
+.cache
+seed_papers
