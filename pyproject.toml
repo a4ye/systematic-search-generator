@@ -3,4 +3,6 @@ name = "systematic-search-generator"
 version = "0.1.0"
 description = "Automated literature retrieval tool that compiles high-quality study lists for systematic reviews"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "biopython>=1.86",
+]
