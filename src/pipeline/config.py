@@ -16,7 +16,7 @@ class PipelineConfig:
     output_dir: Path = field(default_factory=lambda: Path("results"))
 
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o"  # Default model for query generation
+    openai_model: str = "gpt-5.4"  # Default model for query generation
 
     entrez_email: str = "user@example.com"
     entrez_api_key: str | None = None
@@ -28,6 +28,7 @@ class PipelineConfig:
         """Ensure directories exist."""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "PipelineConfig":

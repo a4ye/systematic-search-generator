@@ -11,8 +11,7 @@ Design choices
   invalid headings, so false positives are harmless).
 - Single-word terms are expanded with truncation wildcards for strong
   medical stems (``-ectomy`` → ``ectom*``, ``-operative`` → ``operat*``, …).
-- British/American spelling variants are generated for common medical
-  words (``fiber`` ↔ ``fibre``, ``tumor`` ↔ ``tumour``, …).
+- Hyphen/space variants are generated for multi-word phrases.
 - Cohort-description phrases (``patients undergoing …``) and methodology
   terms (``… questionnaire``) are filtered from exact_phrases / proxy_terms.
 - Case-insensitive deduplication preserving first-seen casing.
@@ -120,10 +119,8 @@ _MIN_STEM_LEN = 3  # minimum chars before the matched suffix
 def truncation_variants(term: str) -> list[str]:
     """Generate wildcard-truncated forms for a single-word medical term.
 
-    Returns a list of 0–2 variants:
+    Returns a list of 0–1 variants:
       * the truncated form itself  (``appendectom*``)
-      * a British surgical variant (``appendicectom*``) when the suffix
-        is ``-ectom*`` and the stem does not already end in ``ic``
     """
     lower = normalize_term(term).lower()
     if not lower or " " in lower or "*" in lower:
@@ -134,84 +131,16 @@ def truncation_variants(term: str) -> list[str]:
             stem = lower[: len(lower) - len(suffix)]
             if len(stem) < _MIN_STEM_LEN:
                 break
-            variants = [stem + replacement]
-            # British surgical spelling: -ectomy → -icectomy
-            # e.g. appendectomy → appendicectomy
-            if replacement == "ectom*" and not stem.endswith("ic"):
-                variants.append(stem + "icectom*")
-            return variants
+            return [stem + replacement]
     return []
 
 
-# British ↔ American spelling pairs (applied word-by-word).
-_SPELLING_VARIANTS: dict[str, str] = {
-    "fiber": "fibre",
-    "fibre": "fiber",
-    "tumor": "tumour",
-    "tumour": "tumor",
-    "color": "colour",
-    "colour": "color",
-    "anemia": "anaemia",
-    "anaemia": "anemia",
-    "edema": "oedema",
-    "oedema": "edema",
-    "estrogen": "oestrogen",
-    "oestrogen": "estrogen",
-    "pediatric": "paediatric",
-    "paediatric": "pediatric",
-    "fetal": "foetal",
-    "foetal": "fetal",
-    "gynecology": "gynaecology",
-    "gynaecology": "gynecology",
-    "hemorrhage": "haemorrhage",
-    "haemorrhage": "hemorrhage",
-    "leukemia": "leukaemia",
-    "leukaemia": "leukemia",
-    "diarrhea": "diarrhoea",
-    "diarrhoea": "diarrhea",
-    "cesarean": "caesarean",
-    "caesarean": "cesarean",
-    "orthopedic": "orthopaedic",
-    "orthopaedic": "orthopedic",
-    "maneuver": "manoeuvre",
-    "manoeuvre": "maneuver",
-}
-
-_WORD_WILDCARD_MAP: dict[str, str] = {
-    "surgery": "surg*",
-    "surgeries": "surg*",
-    "surgical": "surg*",
-    "resection": "resect*",
-    "resections": "resect*",
-    "resected": "resect*",
-    "operation": "operat*",
-    "operative": "operat*",
-    "operatively": "operat*",
-    "carbohydrate": "carbohydrat*",
-    "carbohydrates": "carbohydrat*",
-    "preoperative": "preoperat*",
-    "postoperative": "postoperat*",
-    "perioperative": "perioperat*",
-    "pre-op": "preop*",
-    "post-op": "postop*",
-}
-
-
-def spelling_variant(word: str) -> str | None:
-    """Return the British/American counterpart of a single word, or ``None``."""
-    alt = _SPELLING_VARIANTS.get(word.lower())
-    if alt is None:
-        return None
-    # Preserve capitalisation of the original
-    return alt.capitalize() if word[0].isupper() else alt
-
 
 def expand_terms(raw_terms: list[str]) -> list[str]:
-    """Return *raw_terms* plus truncation and spelling variants.
+    """Return *raw_terms* plus truncation and hyphen/space variants.
 
-    * Single-word terms get truncation variants **and** spelling variants.
-    * Multi-word terms get per-word spelling variants (the full phrase is
-      reproduced with each substituted word).
+    * Single-word terms get truncation variants.
+    * Multi-word terms get hyphen/space variants.
     """
     expanded: list[str] = list(raw_terms)
     for term in raw_terms:
@@ -221,25 +150,9 @@ def expand_terms(raw_terms: list[str]) -> list[str]:
         words = norm.split()
         if len(words) == 1:
             expanded.extend(truncation_variants(norm))
-            sv = spelling_variant(norm)
-            if sv:
-                expanded.append(sv)
-            wildcard = _WORD_WILDCARD_MAP.get(norm.lower())
-            if wildcard:
-                expanded.append(wildcard)
         else:
-            # Multi-word: try spelling variant for each word
-            for i, w in enumerate(words):
-                sv = spelling_variant(w)
-                if sv:
-                    new_words = list(words)
-                    new_words[i] = sv
-                    expanded.append(" ".join(new_words))
-                wildcard = _WORD_WILDCARD_MAP.get(w.lower())
-                if wildcard:
-                    new_words = list(words)
-                    new_words[i] = wildcard
-                    expanded.append(" ".join(new_words))
+            if "-" in norm:
+                expanded.append(norm.replace("-", " "))
     return expanded
 
 
@@ -259,6 +172,8 @@ _COHORT_PREFIXES: tuple[str, ...] = (
     "individuals with ",
     "individuals undergoing ",
     "subjects with ",
+    "following ",
+    "after ",
     "adults with ",
     "adults undergoing ",
     "children with ",
@@ -339,19 +254,24 @@ def _collect_mesh_terms(extracted: dict, facet: str) -> list[str]:
 def _collect_freetext_terms(extracted: dict, facet: str) -> list[str]:
     """Collect free-text terms with lexical expansion and noise filtering.
 
-    Sources: ``core_concepts`` (always trusted), ``exact_phrases`` and
+    Sources: ``core_concepts`` (always trusted), ``strategy_terms``,
+    ``spelling_variants``, ``wildcard_terms``, ``exact_phrases`` and
     ``proxy_terms`` (noise-filtered).  All surviving terms are then
-    expanded with truncation and spelling variants.
+    expanded with truncation and hyphen/space variants.
     """
     raw: list[str] = []
     # Core concepts — always included
     raw.extend(_get_list(extracted, "core_concepts", facet))
+    # Optional structured terms (already curated by extraction)
+    raw.extend(_get_list(extracted, "strategy_terms", facet))
+    raw.extend(_get_list(extracted, "spelling_variants", facet))
+    raw.extend(_get_list(extracted, "wildcard_terms", facet))
     # Exact phrases and proxy terms — noise-filtered
     for section in ("exact_phrases", "proxy_terms"):
         for t in _get_list(extracted, section, facet):
             if not is_noise_term(t):
                 raw.append(t)
-    # Expand with truncation + spelling variants
+    # Expand with truncation + hyphen/space variants
     expanded = expand_terms(raw)
     return [format_tiab(t) for t in expanded if format_tiab(t)]
 

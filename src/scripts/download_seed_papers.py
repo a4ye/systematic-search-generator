@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+from functools import wraps
 from pathlib import Path
 
 import pandas as pd
@@ -39,6 +40,31 @@ RATE_LIMIT_DELAY = 0.1 if Entrez.api_key else 0.34
 
 DATA_DIR = Path(__file__).parent.parent.parent / "data"
 OUTPUT_DIR = Path(__file__).parent.parent.parent / "seed_papers"
+
+# Retry settings
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+
+
+def retry_on_error(max_retries: int = MAX_RETRIES, delay: float = RETRY_DELAY):
+    """Decorator to retry functions on PubMed API errors."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = delay * (2 ** attempt)  # Exponential backoff
+                        print(f"  Retry {attempt + 1}/{max_retries} after {wait_time}s: {e}")
+                        time.sleep(wait_time)
+            print(f"  Failed after {max_retries} attempts: {last_error}")
+            return None
+        return wrapper
+    return decorator
 
 
 def find_included_studies_file(review_dir: Path) -> Path | None:
@@ -60,6 +86,7 @@ def find_included_studies_file(review_dir: Path) -> Path | None:
     return None
 
 
+@retry_on_error()
 def extract_pmid_from_doi(doi: str) -> str | None:
     """Try to get PMID from DOI using PubMed search."""
     if not doi or pd.isna(doi):
@@ -72,98 +99,91 @@ def extract_pmid_from_doi(doi: str) -> str | None:
     elif doi.startswith("http://doi.org/"):
         doi = doi.replace("http://doi.org/", "")
 
-    try:
-        handle = Entrez.esearch(db="pubmed", term=f"{doi}[DOI]", retmax=1)
-        record = Entrez.read(handle)
-        handle.close()
+    handle = Entrez.esearch(db="pubmed", term=f"{doi}[DOI]", retmax=1)
+    record = Entrez.read(handle)
+    handle.close()
 
-        if record["IdList"]:
-            return record["IdList"][0]
-    except Exception as e:
-        print(f"  Warning: Could not search DOI {doi}: {e}")
+    if record["IdList"]:
+        return record["IdList"][0]
 
     return None
 
 
+@retry_on_error()
 def fetch_pubmed_metadata(pmid: str) -> dict | None:
     """Fetch full metadata for a PMID from PubMed."""
-    try:
-        handle = Entrez.efetch(db="pubmed", id=pmid, rettype="xml", retmode="xml")
-        records = Entrez.read(handle)
-        handle.close()
+    handle = Entrez.efetch(db="pubmed", id=pmid, rettype="xml", retmode="xml")
+    records = Entrez.read(handle)
+    handle.close()
 
-        if not records.get("PubmedArticle"):
-            return None
-
-        article = records["PubmedArticle"][0]
-        medline = article["MedlineCitation"]
-        article_data = medline["Article"]
-
-        # Extract title
-        title = str(article_data.get("ArticleTitle", ""))
-
-        # Extract abstract
-        abstract_parts = article_data.get("Abstract", {}).get("AbstractText", [])
-        if isinstance(abstract_parts, list):
-            abstract = " ".join(str(part) for part in abstract_parts)
-        else:
-            abstract = str(abstract_parts)
-
-        # Extract authors
-        authors = []
-        author_list = article_data.get("AuthorList", [])
-        for author in author_list:
-            if "LastName" in author:
-                name = author.get("LastName", "")
-                if "ForeName" in author:
-                    name = f"{author['ForeName']} {name}"
-                authors.append(name)
-
-        # Extract journal info
-        journal = article_data.get("Journal", {})
-        journal_title = str(journal.get("Title", ""))
-
-        # Extract publication date
-        pub_date = journal.get("JournalIssue", {}).get("PubDate", {})
-        year = pub_date.get("Year", "")
-
-        # Extract MeSH terms
-        mesh_list = medline.get("MeshHeadingList", [])
-        mesh_terms = []
-        for mesh in mesh_list:
-            if "DescriptorName" in mesh:
-                mesh_terms.append(str(mesh["DescriptorName"]))
-
-        # Extract keywords
-        keyword_list = medline.get("KeywordList", [])
-        keywords = []
-        for kw_group in keyword_list:
-            for kw in kw_group:
-                keywords.append(str(kw))
-
-        # Extract DOI
-        doi = None
-        article_ids = article.get("PubmedData", {}).get("ArticleIdList", [])
-        for aid in article_ids:
-            if aid.attributes.get("IdType") == "doi":
-                doi = str(aid)
-                break
-
-        return {
-            "pmid": pmid,
-            "doi": doi,
-            "title": title,
-            "abstract": abstract,
-            "authors": authors,
-            "journal": journal_title,
-            "year": year,
-            "mesh_terms": mesh_terms,
-            "keywords": keywords,
-        }
-
-    except Exception as e:
-        print(f"  Warning: Could not fetch PMID {pmid}: {e}")
+    if not records.get("PubmedArticle"):
         return None
+
+    article = records["PubmedArticle"][0]
+    medline = article["MedlineCitation"]
+    article_data = medline["Article"]
+
+    # Extract title
+    title = str(article_data.get("ArticleTitle", ""))
+
+    # Extract abstract
+    abstract_parts = article_data.get("Abstract", {}).get("AbstractText", [])
+    if isinstance(abstract_parts, list):
+        abstract = " ".join(str(part) for part in abstract_parts)
+    else:
+        abstract = str(abstract_parts)
+
+    # Extract authors
+    authors = []
+    author_list = article_data.get("AuthorList", [])
+    for author in author_list:
+        if "LastName" in author:
+            name = author.get("LastName", "")
+            if "ForeName" in author:
+                name = f"{author['ForeName']} {name}"
+            authors.append(name)
+
+    # Extract journal info
+    journal = article_data.get("Journal", {})
+    journal_title = str(journal.get("Title", ""))
+
+    # Extract publication date
+    pub_date = journal.get("JournalIssue", {}).get("PubDate", {})
+    year = pub_date.get("Year", "")
+
+    # Extract MeSH terms
+    mesh_list = medline.get("MeshHeadingList", [])
+    mesh_terms = []
+    for mesh in mesh_list:
+        if "DescriptorName" in mesh:
+            mesh_terms.append(str(mesh["DescriptorName"]))
+
+    # Extract keywords
+    keyword_list = medline.get("KeywordList", [])
+    keywords = []
+    for kw_group in keyword_list:
+        for kw in kw_group:
+            keywords.append(str(kw))
+
+    # Extract DOI
+    doi = None
+    article_ids = article.get("PubmedData", {}).get("ArticleIdList", [])
+    for aid in article_ids:
+        if aid.attributes.get("IdType") == "doi":
+            doi = str(aid)
+            break
+
+    return {
+        "pmid": pmid,
+        "doi": doi,
+        "title": title,
+        "abstract": abstract,
+        "authors": authors,
+        "journal": journal_title,
+        "year": year,
+        "mesh_terms": mesh_terms,
+        "keywords": keywords,
+    }
 
 
 def process_review(review_dir: Path) -> dict:

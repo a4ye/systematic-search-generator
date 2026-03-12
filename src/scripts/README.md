@@ -1,5 +1,73 @@
 # Scripts
 
+## extract_prospero_findings.py
+
+Extracts structured JSON from a PROSPERO PDF to support search-strategy generation.
+
+### Setup
+
+Requires environment variable in `.env`:
+
+```bash
+OPENAI_API_KEY=your_openai_api_key
+```
+
+### Usage
+
+```bash
+# Print findings to terminal
+uv run src/scripts/extract_prospero_findings.py /path/to/prospero.pdf
+
+# Save findings to a JSON file
+uv run src/scripts/extract_prospero_findings.py /path/to/prospero.pdf --output ./results/prospero_findings.json
+
+# Use a specific model
+uv run src/scripts/extract_prospero_findings.py /path/to/prospero.pdf --model gpt-5.4
+```
+
+### Output
+
+Returns structured JSON with fields used for query construction:
+
+- `review_title`
+- `research_objective`
+- `population` and `population_synonyms`
+- `intervention_or_exposure` and `intervention_synonyms`
+- `comparator` and `comparator_synonyms`
+- `outcomes`
+- `study_designs`
+- `conditions_or_diseases`
+- `procedures_or_settings`
+- `keywords_from_protocol`
+- `controlled_vocabulary_terms`
+- `databases_mentioned`
+- `notes_for_search_strategy`
+
+## generate_pubmed_query.py
+
+Generates a single-line PubMed query from extracted JSON, with optional one-step PDF extraction.
+
+### Usage
+
+```bash
+# JSON -> query
+uv run src/scripts/generate_pubmed_query.py --extracted-json ./results/prospero_findings.json
+
+# PDF -> extract -> query
+uv run src/scripts/generate_pubmed_query.py --pdf /path/to/prospero.pdf
+
+# PDF -> extract -> save JSON + save query
+uv run src/scripts/generate_pubmed_query.py \
+  --pdf /path/to/prospero.pdf \
+  --save-extracted ./results/prospero_findings.json \
+  --output ./results/pubmed_query.txt
+```
+
+### Output
+
+- Prints one single-line PubMed query to stdout by default.
+- Optionally saves extracted JSON (`--save-extracted`) and/or query (`--output`).
+
 ## download_seed_papers.py
 
 Downloads metadata for included studies from systematic reviews, preparing them as seed papers for LLM-based search strategy generation.

@@ -144,3 +144,53 @@ Reason:
 Mistakes / Lessons:
 
 - Unfiltered refinement can add unrelated terms (e.g., infection, ERAS, broad MeSH) and explode result counts; post-filtering is required.
+
+## 2026-03-12 Change 7 (Generalizable Spelling/Variant Expansion)
+
+Files:
+
+- `src/mesh/mesh_db.py`
+- `src/mesh/__init__.py`
+- `src/llm/query_generator.py`
+- `src/pipeline/query_builder.py`
+- `tests/test_query_builder.py`
+
+What changed:
+
+- Added a local MeSH descriptor DB loader that downloads and caches the official MeSH XML and exposes entry-term (synonym) lookups.
+- Structured builder now adds a small number of MeSH entry-term synonyms as free-text terms for selected MeSH headings, improving recall without topic-specific hardcoding.
+- Removed the hand-coded British ``-icectomy`` spelling variant from truncation rules; spelling variants now come from MeSH entry terms or the LLM extraction.
+
+Reason:
+
+- Replace the previous ad-hoc spelling/wildcard mapping with a generalizable, domain-wide synonym source that applies across all review topics.
+
+Mistakes / Lessons:
+
+- Hand-coded spelling variants quickly drift toward overfitting; prefer curated, domain-wide vocabularies (MeSH entry terms) for robust coverage.
+
+## 2026-03-12 Change 8 (LLM-First Querying + Token-Guided Filtering)
+
+Files:
+
+- `src/llm/query_generator.py`
+- `src/llm/openai_client.py`
+
+What changed:
+
+- Switched to LLM-first query composition (structured builder is now fallback).
+- Added token-guided filtering of LLM queries to remove off-topic terms while keeping core concept coverage.
+- Added conservative wildcard pruning for overly short stems (unless they match core tokens).
+- Set LLM temperature to `0` for determinism and reduced run-to-run variability.
+- Added modifier wildcarding for exposure phrases (e.g., preoperat* carbohydrate) and plural normalization in token matching.
+
+Reason:
+
+- The deterministic builder plateaued below human recall. LLM-first plus token filtering improved recall to human-level while keeping precision within a reasonable margin.
+- Determinism reduces noise across runs and makes benchmarking reliable.
+
+Mistakes / Lessons:
+
+- Raw LLM output can introduce unrelated terms; filtering against core tokens is necessary.
+- Overly aggressive filtering (or removing weak tokens entirely) can undercut recall; the filter must preserve core-concept stems.
+- Token-based MeSH lookup by single tokens produced irrelevant headings; avoid naive substring-based expansion.

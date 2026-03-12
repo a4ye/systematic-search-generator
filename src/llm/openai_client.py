@@ -102,6 +102,20 @@ class OpenAIClient:
         retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
+    def generate_text(
+        self,
+        prompt: str,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Send a plain text prompt and return response."""
+        return self._generate_text(prompt, max_tokens, time.time())
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=4, max=60),
+        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
     def generate_with_file(
         self,
         prompt: str,
@@ -158,6 +172,7 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -205,6 +220,7 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": messages,
+            "temperature": 0,
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
@@ -239,6 +255,7 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": [{"role": "user", "content": full_prompt}],
+            "temperature": 0,
         }
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens

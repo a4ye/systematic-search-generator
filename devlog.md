@@ -335,6 +335,44 @@ I will now built an automated testing pipeline to systematically evaluate differ
 a larger set of systematic reviews. I am currently doing it manually to understand the nuances, but it is too
 time-consuming to do at scale.
 
+I made a script to download infomration included studies from all of the training data in order to use them as seed
+papers. A
+select random number of seed papers will be used in the workflow.
+
+════════════════════════════════════════════════════════════
+AGGREGATE COMPARISON (10 studies)
+════════════════════════════════════════════════════════════
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃ Metric ┃ LLM ┃ Human ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ Mean Recall (PubMed) │ 83.6% │ 92.2% │
+│ Mean Precision │ 2.26% │ 8.01% │
+└──────────────────────┴───────┴───────┘
+
+Results did not improve by much, and there is still decent amount of variance. Will run again since seed papers are
+selected randomly.
+
+Instead of one shotting the query, I will now try a multi step process where first:
+1. the llm generates pico from the prospero
+2. it does mesh expansion
+3. and then refines the query using  the seed papers
+
+more ideas:
+- vector embeddinds / semantics of terms
+- maybe find most similar terms to the seed papers and make sure they are included in the query
+- may need to manually populate a vector db
+
+- cache human pubmed queries *IMPORTANT* TODO
+
+- look at actual content and determine if it matches the prospero
+- -> if not determine why and improve the query iteratively
+- perhaps it might be possible to do it using only the title, abstraact and not the full text of the paper, which would be more realistic and also more scalable
+- prompting techniques such as adding info in the beginning and end of the prompt, or using a chain of thought prompting to make the llm reason step by step
+- citation expansion
+- use pubmed api to find papers similar to the seed papers (it is already built into the api) and use as additional seed papers, or to make sure they are included in the query
+- using hedges (medical libarians use them)
+
+
 ## Next Steps
 
 - Use seed papers to better mimic the human search development workflow

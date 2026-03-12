@@ -1,6 +1,7 @@
 """Main pipeline orchestrator for testing LLM-generated search queries."""
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -26,8 +27,10 @@ from src.pubmed.search_executor import PubMedExecutor, PubMedSearchResults
 class PipelineRunner:
     """Main orchestrator for the testing pipeline."""
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, max_seeds: int | None = 3, rng_seed: int | None = None):
         self.config = config
+        self.max_seeds = max_seeds
+        self.rng_seed = rng_seed
         self.console = Console()
         self.reporter = Reporter(self.console)
 
@@ -59,7 +62,14 @@ class PipelineRunner:
     @property
     def query_generator(self) -> QueryGenerator:
         if self._query_generator is None:
-            self._query_generator = QueryGenerator(self.openai_client)
+            self._query_generator = QueryGenerator(
+                self.openai_client,
+                max_seeds=self.max_seeds,
+                rng_seed=self.rng_seed,
+                cache_dir=self.config.cache_dir,
+                entrez_email=self.config.entrez_email,
+                entrez_api_key=self.config.entrez_api_key,
+            )
         return self._query_generator
 
     @property
@@ -147,11 +157,21 @@ class PipelineRunner:
                 self.console.print(f"  [dim]Using pre-generated LLM query...[/dim]")
             else:
                 t0 = time.time()
-                self.console.print(f"  [dim]Generating LLM query...[/dim]")
-                generated = self.query_generator.generate_query(study.prospero_pdf)
+                self.console.print(f"  [dim]Generating LLM query (Extract → Compose → Refine)...[/dim]")
+                generated = self.query_generator.generate_query(
+                    study.prospero_pdf
+                )
                 self.console.print(f"  [dim]  -> LLM generation: {time.time() - t0:.1f}s[/dim]")
 
             result.llm_query = generated.query
+
+            # Print pipeline output
+            if generated.extracted_json is not None:
+                self.console.print(f"\n  [bold]Step 1 — Extracted JSON:[/bold]")
+                self.console.print(json.dumps(generated.extracted_json, indent=2, ensure_ascii=False))
+            self.console.print(f"\n  [bold]Steps 2+3 — Composed & Refined Query:[/bold]")
+            self.console.print(generated.query)
+            self.console.print()
 
             if not generated.is_valid:
                 result.llm_error = f"Invalid query: {', '.join(generated.validation_errors)}"
@@ -163,8 +183,8 @@ class PipelineRunner:
             self.console.print(f"  [dim]Executing LLM query on PubMed...[/dim]")
             result_count = self.pubmed.count_results(generated.query)
 
-            if result_count > 20000:
-                result.llm_error = f"Query too broad: {result_count:,} results (max 20,000)"
+            if result_count > 50000:
+                result.llm_error = f"Query too broad: {result_count:,} results (max 50,000)"
                 self.console.print(f"  [dim]  -> Skipped: {result_count:,} results exceeds limit[/dim]")
                 return result
 
@@ -296,12 +316,13 @@ class PipelineRunner:
             if studies_with_prospero:
                 t0 = time.time()
                 self.console.print(
-                    f"[dim]Generating {len(studies_with_prospero)} LLM queries in parallel "
-                    f"(max {max_llm_workers} workers)...[/dim]"
+                    f"[dim]Generating {len(studies_with_prospero)} LLM queries "
+                    f"(Extract → Compose → Refine, max {max_llm_workers} workers)...[/dim]"
                 )
                 prospero_paths = [s.prospero_pdf for s in studies_with_prospero]
                 generated = self.query_generator.generate_queries_batch(
-                    prospero_paths, max_workers=max_llm_workers
+                    prospero_paths,
+                    max_workers=max_llm_workers,
                 )
                 for study, query in zip(studies_with_prospero, generated):
                     pregenerated_queries[study.study_id] = query
@@ -409,6 +430,22 @@ def main():
         help="Output directory for reports (default: results/)",
     )
 
+    # Seed paper options
+    parser.add_argument(
+        "--max-seeds",
+        type=int,
+        default=3,
+        help="Max number of seed papers to sample per study (default: 3). "
+             "Simulates realistic scenario where reviewers only have a few "
+             "known papers. Use 0 or -1 for all (not recommended).",
+    )
+    parser.add_argument(
+        "--rng-seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible seed-paper sampling.",
+    )
+
     args = parser.parse_args()
 
     # Load configuration
@@ -427,7 +464,8 @@ def main():
             sys.exit(1)
 
     # Initialize runner
-    runner = PipelineRunner(config)
+    max_seeds = args.max_seeds if args.max_seeds > 0 else None
+    runner = PipelineRunner(config, max_seeds=max_seeds, rng_seed=args.rng_seed)
     console = runner.console
 
     # Handle list command

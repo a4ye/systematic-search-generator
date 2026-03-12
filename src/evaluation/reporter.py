@@ -182,6 +182,14 @@ class Reporter:
         if result.human_error:
             self.console.print(f"[red]Human Error: {result.human_error}[/red]")
 
+        # Print both queries
+        if result.llm_query:
+            self.console.print(f"\n[bold]LLM Query:[/bold]")
+            self.console.print(result.llm_query)
+        if result.human_query:
+            self.console.print(f"\n[bold]Human Query:[/bold]")
+            self.console.print(result.human_query)
+
         self.console.print()
 
     def print_summary_table(self, results: list[ComparisonResult]) -> None:
@@ -291,6 +299,8 @@ class Reporter:
             llm = r.llm_metrics
             human = r.human_metrics
 
+            rel = r.precision_relative_change
+            rel_str = f" ({rel:.1f}x)" if rel is not None else ""
             lines.extend([
                 f"### {r.study_id} - {r.study_name}",
                 "",
@@ -298,7 +308,7 @@ class Reporter:
                 "|--------|-----|-------|",
                 f"| Results | {llm.total_results if llm else 'N/A'} | {human.total_results if human else 'N/A'} |",
                 f"| Recall (PubMed) | {llm.recall_pubmed_only*100:.1f}% | {human.recall_pubmed_only*100:.1f}% |" if llm and human else "",
-                f"| Precision | {llm.precision*100:.2f}% | {human.precision*100:.2f}% |" if llm and human else "",
+                f"| Precision | {llm.precision*100:.2f}%{rel_str} | {human.precision*100:.2f}% |" if llm and human else "",
                 f"| Winner | {r.winner} |" if r.has_both else "",
                 "",
             ])
@@ -330,6 +340,8 @@ class Reporter:
                 "human_recall_pubmed",
                 "human_precision",
                 "human_nnr",
+                "precision_diff",
+                "precision_relative_change",
                 "winner",
             ])
 
@@ -349,5 +361,7 @@ class Reporter:
                     f"{human.recall_pubmed_only:.4f}" if human else "",
                     f"{human.precision:.4f}" if human else "",
                     f"{human.nnr:.2f}" if human else "",
+                    f"{r.precision_difference:.4f}" if r.precision_difference is not None else "",
+                    f"{r.precision_relative_change:.2f}" if r.precision_relative_change is not None else "",
                     r.winner or "",
                 ])

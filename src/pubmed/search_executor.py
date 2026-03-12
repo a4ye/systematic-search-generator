@@ -3,7 +3,9 @@
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from http.client import IncompleteRead, RemoteDisconnected
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 from Bio import Entrez, Medline
 
@@ -105,10 +107,29 @@ class PubMedExecutor:
         self.batch_size = batch_size
         # Rate limit: 3/sec without API key, 10/sec with API key
         self.rate_limit_delay = 0.1 if api_key else 0.34
+        self.max_retries = 4
+
+    def _entrez_call_with_retry(self, fn, **kwargs):
+        """Call an Entrez function with retry/backoff for transient failures."""
+        for attempt in range(self.max_retries):
+            try:
+                return fn(**kwargs)
+            except (URLError, RemoteDisconnected, IncompleteRead, TimeoutError, ConnectionError, OSError) as exc:
+                if attempt >= self.max_retries - 1:
+                    raise
+                # Exponential backoff capped at 8s
+                time.sleep(min(2 ** attempt, 8))
+            except HTTPError as exc:
+                # Syntax / bad request should fail fast
+                if exc.code in (400, 404):
+                    raise
+                if attempt >= self.max_retries - 1:
+                    raise
+                time.sleep(min(2 ** attempt, 8))
 
     def count_results(self, query: str) -> int:
         """Get result count without downloading records."""
-        handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
+        handle = self._entrez_call_with_retry(Entrez.esearch, db="pubmed", term=query, retmax=0)
         results = Entrez.read(handle)
         handle.close()
         return int(results.get("Count", 0))
@@ -122,7 +143,8 @@ class PubMedExecutor:
         start_time = time.time()
 
         # First, search to get IDs
-        handle = Entrez.esearch(
+        handle = self._entrez_call_with_retry(
+            Entrez.esearch,
             db="pubmed",
             term=query,
             retmax=max_results,
@@ -150,7 +172,8 @@ class PubMedExecutor:
         for start in range(0, len(id_list), self.batch_size):
             time.sleep(self.rate_limit_delay)
 
-            handle = Entrez.efetch(
+            handle = self._entrez_call_with_retry(
+                Entrez.efetch,
                 db="pubmed",
                 rettype="medline",
                 retmode="text",
@@ -187,7 +210,8 @@ class PubMedExecutor:
         start_time = time.time()
 
         # First, search to get IDs
-        handle = Entrez.esearch(
+        handle = self._entrez_call_with_retry(
+            Entrez.esearch,
             db="pubmed",
             term=query,
             retmax=max_results,
@@ -215,7 +239,8 @@ class PubMedExecutor:
         for start in range(0, len(id_list), self.batch_size):
             time.sleep(self.rate_limit_delay)
 
-            handle = Entrez.esummary(
+            handle = self._entrez_call_with_retry(
+                Entrez.esummary,
                 db="pubmed",
                 retstart=start,
                 retmax=self.batch_size,
@@ -258,6 +283,58 @@ class PubMedExecutor:
                 result.doi_map[doi] = {"pmid": pmid, "title": "(fast)"}
 
         return result
+
+    def validate_query_captures_pmids(
+        self,
+        query: str,
+        pmids: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Check which PMIDs a query captures.
+
+        Tests the query against known PMIDs by searching:
+        (query) AND (pmid1[uid] OR pmid2[uid] OR ...)
+
+        Args:
+            query: PubMed query to test
+            pmids: List of PMIDs that should be in results
+
+        Returns:
+            Tuple of (found_pmids, missed_pmids)
+        """
+        if not pmids:
+            return [], []
+
+        # Build a query that intersects with the target PMIDs
+        # Process in batches to avoid query length limits
+        all_found: set[str] = set()
+        batch_size = 50  # PMIDs per validation batch
+
+        for start in range(0, len(pmids), batch_size):
+            time.sleep(self.rate_limit_delay)
+            batch = pmids[start:start + batch_size]
+
+            pmid_filter = " OR ".join(f"{p}[uid]" for p in batch)
+            validation_query = f"({query}) AND ({pmid_filter})"
+
+            try:
+                handle = self._entrez_call_with_retry(
+                    Entrez.esearch,
+                    db="pubmed",
+                    term=validation_query,
+                    retmax=len(batch),
+                )
+                results = Entrez.read(handle)
+                handle.close()
+
+                found_ids = results.get("IdList", [])
+                all_found.update(found_ids)
+            except Exception:
+                # If validation fails, assume all found (don't block generation)
+                all_found.update(batch)
+
+        found = [p for p in pmids if p in all_found]
+        missed = [p for p in pmids if p not in all_found]
+        return found, missed
 
     def fetch_by_pmids(self, pmids: list[str]) -> list[dict[str, Any]]:
         """Fetch records by PMID list."""
