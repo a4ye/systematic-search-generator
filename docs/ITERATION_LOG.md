@@ -97,3 +97,50 @@ Reason:
 Mistakes / Lessons:
 
 - Overly broad subheading terms (e.g., `Colonic Diseases/surgery`) caused large result inflation; additional cleanup rules added.
+
+## 2026-03-12 Change 5 (Generalizable Structured Builder + MeSH Expansion)
+
+Files:
+
+- `src/llm/query_generator.py`
+- `src/cache/mesh_expansion_cache.py`
+
+What changed:
+
+- Structured builder now optionally expands top-scoring text concepts to MeSH using NCBI E-utilities (with persistent cache).
+- Added stronger filtering for always-broad MeSH (e.g., `Signs and Symptoms`) and dropped demographic MeSH unless age is clearly signaled.
+- Population block now nests age qualifiers with disease terms when age-limited reviews are detected, avoiding standalone demographic MeSH.
+- Removed diet/nutrition special-case composers from the main path in favor of a single generalizable builder (symptom rule retained).
+
+Reason:
+
+- Reduce overfitting to specific studies and improve generalization across medical topics.
+- Use consistent, seed-aware rules plus controlled MeSH expansion to improve recall without bloating queries.
+
+Mistakes / Lessons:
+
+- Special-case builders for a single topic tend to overfit and harm generalizability; favor generic scoring + expansion instead.
+
+## 2026-03-12 Change 6 (Seed-Aware Refinement + Diet Filtering)
+
+Files:
+
+- `src/llm/query_generator.py`
+- `src/pipeline/query_builder.py`
+
+What changed:
+
+- Added broader, general-purpose lexical expansions (e.g., `surg*`, `resect*`, `carbohydrat*`, `preoperat*`) for multi-word terms.
+- Introduced controlled diet exposure boosts (diet/fiber/plant-based variants) and carbohydrate-specific boosts.
+- Added title-based phrase extraction (short bigrams) to pull high-signal phrases from seed titles.
+- Re-enabled LLM refinement but filtered added terms by exposure-core tokens (general case) and diet token whitelist (diet reviews) to prevent drift to irrelevant concepts.
+- Seed keyword enrichment now ignores overlaps only on weak tokens (e.g., surgery/procedure) to reduce noise.
+
+Reason:
+
+- Recover recall for heterogeneous diet and perioperative nutrition reviews while keeping precision from collapsing due to overly broad added terms.
+- Ensure refined queries only add terms that align with extracted core concepts or diet-related language.
+
+Mistakes / Lessons:
+
+- Unfiltered refinement can add unrelated terms (e.g., infection, ERAS, broad MeSH) and explode result counts; post-filtering is required.

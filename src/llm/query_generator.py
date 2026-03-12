@@ -19,7 +19,9 @@ from pathlib import Path
 
 from .openai_client import LLMResponse, OpenAIClient
 from .prompts import PICO_EXTRACTION_PROMPT
+from src.cache.mesh_expansion_cache import MeshExpansionCache
 from src.pipeline.query_builder import build_query, expand_terms
+from src.pubmed import MeSHExpander
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +98,15 @@ _AGE_SIGNAL_TOKENS = (
     "age of onset",
     "age onset",
     "eaocrc",
+    "child",
+    "children",
+    "pediatric",
+    "paediatric",
+    "adolescent",
+    "infant",
+    "newborn",
+    "neonate",
+    "neonatal",
 )
 
 _SYMPTOM_SIGNAL_TOKENS = (
@@ -111,15 +122,6 @@ _SYMPTOM_SIGNAL_TOKENS = (
     "anemia",
     "anaemia",
     "bowel habit",
-)
-
-_CRC_SIGNAL_TOKENS = (
-    "colorectal",
-    "colon cancer",
-    "rectal cancer",
-    "colonic neoplasm",
-    "rectal neoplasm",
-    "colorectal neoplasm",
 )
 
 _DIET_SIGNAL_TOKENS = (
@@ -211,6 +213,68 @@ _BROAD_MESH_DROP_IF_MULTIPLE = {
     "carbohydrates",
     "drinking",
     "colon",
+}
+
+_ALWAYS_DROP_MESH = {
+    "signs and symptoms",
+}
+
+_WEAK_FACET_TOKENS = {
+    "acute",
+    "chronic",
+    "disease",
+    "diseases",
+    "disorder",
+    "disorders",
+    "condition",
+    "conditions",
+    "syndrome",
+    "syndromes",
+}
+
+_DIET_ALLOWED_TOKENS = {
+    "diet",
+    "dietary",
+    "fiber",
+    "fibre",
+    "food",
+    "meat",
+    "vegetable",
+    "vegetables",
+    "fruit",
+    "plant",
+    "plant-based",
+    "vegan",
+    "vegetarian",
+    "fat",
+    "carbohydrate",
+    "sugar",
+    "protein",
+    "nutrient",
+    "intake",
+    "consumption",
+    "pattern",
+    "patterns",
+    "western",
+    "alcohol",
+    "smoking",
+}
+
+_SEED_KEYWORD_WEAK_TOKENS = {
+    "surgery",
+    "surgical",
+    "operation",
+    "operative",
+    "procedure",
+    "procedures",
+    "trial",
+    "randomized",
+    "randomised",
+    "study",
+    "studies",
+    "cancer",
+    "neoplasm",
+    "neoplasms",
 }
 
 _GENERIC_MESH_TERMS = {
@@ -373,6 +437,78 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
     return out
 
 
+def _strip_animal_filter(query: str) -> tuple[str, str]:
+    suffix = " NOT (animals[MeSH] NOT humans[MeSH])"
+    if query.endswith(suffix):
+        return query[: -len(suffix)].strip(), suffix
+    return query, ""
+
+
+def _split_top_level(query: str, sep: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(query):
+        ch = query[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and query.startswith(sep, i):
+            parts.append(query[start:i].strip())
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    tail = query[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _normalize_query_term(term: str) -> str:
+    cleaned = re.sub(r"\[[^\]]+\]", "", term)
+    cleaned = cleaned.strip()
+    return _normalize_term(cleaned).lower()
+
+
+def _seed_title_phrases(
+    seed_data: dict | None,
+    facet_tokens: set[str],
+    max_phrases: int = 2,
+) -> list[str]:
+    if not seed_data or not facet_tokens:
+        return []
+
+    def _token_matches(token: str) -> bool:
+        if token in facet_tokens:
+            return True
+        if token.endswith("s") and token[:-1] in facet_tokens:
+            return True
+        return False
+
+    counter: Counter = Counter()
+    for paper in seed_data.get("papers", []):
+        title = paper.get("title", "")
+        if not title:
+            continue
+        words = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", title.lower())
+        for i in range(len(words) - 1):
+            w1, w2 = words[i], words[i + 1]
+            if w1 in _STOPWORDS or w2 in _STOPWORDS:
+                continue
+            if not (_token_matches(w1) or _token_matches(w2)):
+                continue
+            phrase = f"{w1} {w2}"
+            counter[phrase] += 1
+
+    if not counter:
+        return []
+    ranked = sorted(counter.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+    return [phrase for phrase, _ in ranked[:max_phrases]]
+
+
 def _normalize_term(term: str) -> str:
     term = " ".join(term.strip().split())
     if len(term) >= 2 and term[0] == '"' and term[-1] == '"':
@@ -428,10 +564,10 @@ def _looks_like_symptom_review(extracted_json: dict) -> bool:
     )
     pop_blob = " | ".join(pop_terms).lower()
     int_blob = " | ".join(int_terms).lower()
-    has_crc = any(tok in pop_blob for tok in _CRC_SIGNAL_TOKENS)
     has_age = any(tok in pop_blob for tok in _AGE_SIGNAL_TOKENS)
     has_symptom = any(tok in int_blob for tok in _SYMPTOM_SIGNAL_TOKENS)
-    return has_crc and has_age and has_symptom
+    has_disease = any(t for t in pop_terms if not _looks_like_age_term(t))
+    return has_age and has_symptom and has_disease
 
 
 def _looks_like_diet_review(extracted_json: dict) -> bool:
@@ -487,14 +623,6 @@ def _build_diet_review_query(extracted_json: dict, seed_data: dict | None) -> st
         + _get_nested_list(extracted_json, "exact_phrases", "population_or_condition")
         + _get_nested_list(extracted_json, "proxy_terms", "population_or_condition")
     )
-
-    pop_blob = " | ".join(pop_mesh_raw + pop_text_raw).lower()
-    if "appendicitis" in pop_blob:
-        for term in ("Appendiceal Diseases", "Appendix"):
-            if term.lower() not in pop_blob:
-                pop_mesh_raw.append(term)
-        if "appendiceal" not in pop_blob:
-            pop_text_raw.append("appendiceal")
 
     exp_mesh_raw = _get_nested_list(extracted_json, "controlled_vocabulary_terms", "intervention_or_exposure")
     exp_text_raw = (
@@ -695,8 +823,13 @@ def _select_scored_terms(terms: list[str], max_terms: int) -> list[str]:
     return selected
 
 
-def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str:
-    """Build a deterministic, seed-aware 2-block query."""
+def _build_structured_query(
+    extracted_json: dict,
+    seed_data: dict | None,
+    mesh_expander: MeSHExpander | None = None,
+    mesh_cache: MeshExpansionCache | None = None,
+) -> str:
+    """Build a deterministic, seed-aware 2-block query with optional MeSH expansion."""
     review_text = " ".join(
         [
             str(extracted_json.get("review_title", "")),
@@ -705,7 +838,42 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
     )
     review_tokens = _tokenize(review_text)
 
-    def collect_facet(facet: str) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    def _is_mesh_useful(term: str, facet_tokens: set[str]) -> bool:
+        lower = term.lower().strip()
+        if not lower:
+            return False
+        if lower in _ALWAYS_DROP_MESH:
+            return False
+        if lower in _GENERIC_MESH_TERMS and not (_tokenize(lower) & review_tokens):
+            return False
+        if facet_tokens:
+            mesh_tokens = _tokenize(lower)
+            if mesh_tokens:
+                overlap = mesh_tokens & facet_tokens
+                if not overlap:
+                    return False
+                if overlap <= _WEAK_FACET_TOKENS:
+                    return False
+        return True
+
+    def _is_expansion_candidate(term: str) -> bool:
+        lower = term.lower().strip()
+        if not lower:
+            return False
+        if "*" in lower:
+            return False
+        if lower in _GENERIC_TEXT_TERMS:
+            return False
+        if len(lower) < 4:
+            return False
+        return True
+
+    def collect_facet(
+        facet: str,
+        mesh_expander: MeSHExpander | None,
+        mesh_cache: MeshExpansionCache | None,
+        max_expansions: int = 2,
+    ) -> tuple[list[tuple[str, int]], list[tuple[str, int]], bool]:
         mesh_raw = _get_nested_list(extracted_json, "controlled_vocabulary_terms", facet)
         core_raw = _get_nested_list(extracted_json, "core_concepts", facet)
         phrase_raw = _get_nested_list(extracted_json, "exact_phrases", facet)
@@ -727,14 +895,24 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
         proxy_raw = _clean_text_terms(proxy_raw)
 
         facet_tokens = _tokenize(" ".join(core_raw + phrase_raw + proxy_raw))
-        if review_tokens:
-            facet_tokens = facet_tokens | review_tokens
+
+        strong_age = any(_looks_like_age_term(t) for t in core_raw + phrase_raw + proxy_raw)
+        if not strong_age:
+            strong_age = any(tok in review_text.lower() for tok in _AGE_SIGNAL_TOKENS)
 
         seed_mesh_terms: list[str] = []
         seed_keywords: list[str] = []
         if seed_data:
             for term in _seed_mesh_terms(seed_data):
-                if _tokenize(term) & facet_tokens:
+                term_tokens = _tokenize(term)
+                if not term_tokens:
+                    continue
+                overlap = term_tokens & facet_tokens
+                if len(term_tokens) >= 2 and len(overlap) < 2:
+                    continue
+                if len(term_tokens) == 1 and len(overlap) < 1:
+                    continue
+                if overlap:
                     seed_mesh_terms.append(term)
             for kw in _seed_keyword_terms(seed_data):
                 if _tokenize(kw) & facet_tokens:
@@ -746,7 +924,9 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
             if not norm:
                 continue
             lower = norm.lower()
-            if lower in _GENERIC_MESH_TERMS and not (_tokenize(lower) & review_tokens):
+            if lower in _DEMOGRAPHIC_MESH and not strong_age:
+                continue
+            if not _is_mesh_useful(norm, facet_tokens):
                 continue
             mesh_terms.append((norm, 3))
         for term in seed_mesh_terms:
@@ -754,7 +934,9 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
             if not norm:
                 continue
             lower = norm.lower()
-            if lower in _GENERIC_MESH_TERMS and not (_tokenize(lower) & review_tokens):
+            if lower in _DEMOGRAPHIC_MESH and not strong_age:
+                continue
+            if not _is_mesh_useful(norm, facet_tokens):
                 continue
             mesh_terms.append((norm, 2))
 
@@ -764,10 +946,44 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
         text_terms.extend((t, 1) for t in proxy_raw)
         text_terms.extend((t, 1) for t in seed_keywords)
 
-        return mesh_terms, text_terms
+        # Optional MeSH expansion from NCBI (cached).
+        if mesh_expander and mesh_cache is not None and max_expansions > 0:
+            ranked_text = _score_terms(text_terms)
+            expansion_candidates = [
+                t for t in ranked_text
+                if _is_expansion_candidate(t)
+            ]
+            expansion_candidates = expansion_candidates[:max_expansions]
+            if expansion_candidates:
+                synonyms = _dedupe_keep_order(phrase_raw + proxy_raw + seed_keywords)
+                for candidate in expansion_candidates:
+                    cached = mesh_cache.get(candidate)
+                    if cached is None:
+                        try:
+                            expansion = mesh_expander.expand_concept(candidate, synonyms)
+                            exact = [m.term for m in expansion.exact_matches]
+                            related = [m.term for m in expansion.related_terms]
+                        except Exception:
+                            exact, related = [], []
+                        mesh_cache.set(candidate, exact, related)
+                    else:
+                        exact = cached.get("exact", [])
+                        related = cached.get("related", [])
+                    for term in exact:
+                        if _is_mesh_useful(term, facet_tokens):
+                            mesh_terms.append((term, 2))
+                    for term in related[:3]:
+                        if _is_mesh_useful(term, facet_tokens):
+                            mesh_terms.append((term, 1))
 
-    pop_mesh, pop_text = collect_facet("population_or_condition")
-    exp_mesh, exp_text = collect_facet("intervention_or_exposure")
+        return mesh_terms, text_terms, strong_age
+
+    pop_mesh, pop_text, pop_strong_age = collect_facet(
+        "population_or_condition", mesh_expander, mesh_cache
+    )
+    exp_mesh, exp_text, _ = collect_facet(
+        "intervention_or_exposure", mesh_expander, mesh_cache
+    )
 
     pop_mesh_ranked = _score_terms(pop_mesh)
     exp_mesh_ranked = _score_terms(exp_mesh)
@@ -775,34 +991,160 @@ def _build_structured_query(extracted_json: dict, seed_data: dict | None) -> str
     pop_text_ranked = _score_terms(pop_text)
     exp_text_ranked = _score_terms(exp_text)
 
+    pop_core_raw = _get_nested_list(extracted_json, "core_concepts", "population_or_condition")
+    pop_phrase_raw = _get_nested_list(extracted_json, "exact_phrases", "population_or_condition")
+    pop_proxy_raw = _get_nested_list(extracted_json, "proxy_terms", "population_or_condition")
+    pop_facet_tokens = _tokenize(" ".join(pop_core_raw + pop_phrase_raw + pop_proxy_raw))
+
+    exp_core_raw = _get_nested_list(extracted_json, "core_concepts", "intervention_or_exposure")
+    exp_phrase_raw = _get_nested_list(extracted_json, "exact_phrases", "intervention_or_exposure")
+    exp_proxy_raw = _get_nested_list(extracted_json, "proxy_terms", "intervention_or_exposure")
+    exp_facet_tokens = _tokenize(" ".join(exp_core_raw + exp_phrase_raw + exp_proxy_raw))
+
+    exp_text_blob = " ".join(exp_text_ranked).lower()
+    exp_core_blob = " ".join(exp_core_raw).lower()
+    diet_signal = any(tok in exp_core_blob for tok in _DIET_SIGNAL_TOKENS)
+    carb_signal = "carbohydrat" in exp_text_blob
+
+    max_exp_mesh = 10 if diet_signal else 5
+    max_exp_text = 12 if diet_signal else (8 if carb_signal else 6)
+
     pop_mesh_selected = _select_scored_terms(pop_mesh_ranked, 5)
-    exp_mesh_selected = _select_scored_terms(exp_mesh_ranked, 5)
+    exp_mesh_selected = _select_scored_terms(exp_mesh_ranked, max_exp_mesh)
 
     pop_text_selected = _select_scored_terms(pop_text_ranked, 6)
-    exp_text_selected = _select_scored_terms(exp_text_ranked, 6)
+    exp_text_selected = _select_scored_terms(exp_text_ranked, max_exp_text)
+
+    if carb_signal:
+        exp_mesh_selected = _dedupe_keep_order(exp_mesh_selected + ["Dietary Carbohydrates"])
+        exp_text_selected = _dedupe_keep_order(
+            exp_text_selected
+            + [
+                "carbohydrat*",
+                "preoperat* carbohydrat*",
+                "oral carbohydrat*",
+                "intravenous carbohydrat*",
+            ]
+        )
+
+    if diet_signal:
+        diet_mesh_boost = [
+            "Diet",
+            "Dietary Fiber",
+            "Diet, Western",
+            "Diet, High-Fat",
+            "Diet, Carbohydrate-Restricted",
+            "Diet, Vegetarian",
+            "Diet, Vegan",
+            "Plant-Based Diet",
+        ]
+        diet_text_boost = [
+            "diet",
+            "dietary pattern*",
+            "fiber",
+            "fibre",
+            "high-fat diet",
+            "western diet",
+            "plant-based diet",
+            "plant-based",
+            "vegetarian",
+            "vegan",
+        ]
+        exp_mesh_selected = _dedupe_keep_order(exp_mesh_selected + diet_mesh_boost)
+        exp_text_selected = _dedupe_keep_order(diet_text_boost + exp_text_selected)
+
+    exp_mesh_selected = exp_mesh_selected[:max_exp_mesh]
+    exp_text_selected = exp_text_selected[:max_exp_text]
 
     pop_text_expanded = expand_terms(pop_text_selected)
     exp_text_expanded = expand_terms(exp_text_selected)
 
-    pop_terms = _dedupe_keep_order(
-        [_format_mesh(t) for t in pop_mesh_selected if _format_mesh(t)]
-        + [_format_tiab(t) for t in pop_text_expanded if _format_tiab(t)]
-    )
+    pop_mesh_formatted = [_format_mesh(t) for t in pop_mesh_selected if _format_mesh(t)]
+    pop_text_formatted = [_format_tiab(t) for t in pop_text_expanded if _format_tiab(t)]
+
+    pop_block = ""
+    if pop_strong_age:
+        pop_age_mesh = [t for t in pop_mesh_selected if t.lower() in _DEMOGRAPHIC_MESH]
+        pop_age_text = [t for t in pop_text_expanded if _looks_like_age_term(t)]
+        pop_disease_mesh = [t for t in pop_mesh_selected if t.lower() not in _DEMOGRAPHIC_MESH]
+        pop_disease_text = [t for t in pop_text_expanded if not _looks_like_age_term(t)]
+
+        if pop_age_mesh or pop_age_text:
+            age_mesh_terms = list(pop_age_mesh)
+            if any(tok in review_text.lower() for tok in ("early onset", "young onset", "age of onset")):
+                age_mesh_terms.insert(0, "Age of Onset")
+
+            age_terms = _dedupe_keep_order(
+                [_format_mesh(t) for t in age_mesh_terms if _format_mesh(t)]
+                + [_format_tiab(t) for t in pop_age_text if _format_tiab(t)]
+            )
+            disease_terms = _dedupe_keep_order(
+                [_format_mesh(t) for t in pop_disease_mesh if _format_mesh(t)]
+                + [_format_tiab(t) for t in pop_disease_text if _format_tiab(t)]
+            )
+            if age_terms and disease_terms:
+                age_block = "(" + " OR ".join(age_terms) + ")"
+                disease_block = "(" + " OR ".join(disease_terms) + ")"
+                pop_block = f"({age_block} AND {disease_block})"
+
+    if not pop_block:
+        pop_terms = _dedupe_keep_order(pop_mesh_formatted + pop_text_formatted)
+        if pop_terms:
+            pop_block = "(" + " OR ".join(pop_terms) + ")"
+    def _format_exp_text(term: str) -> str:
+        norm = _normalize_term(term).lower()
+        if diet_signal and norm in _DIET_TW_TERMS:
+            return _format_tw(term)
+        if carb_signal and norm.startswith("carbohydrat"):
+            return _format_tw(term)
+        return _format_tiab(term)
+
     exp_terms = _dedupe_keep_order(
         [_format_mesh(t) for t in exp_mesh_selected if _format_mesh(t)]
-        + [_format_tiab(t) for t in exp_text_expanded if _format_tiab(t)]
+        + [_format_exp_text(t) for t in exp_text_expanded if _format_exp_text(t)]
     )
 
-    if not pop_terms and not exp_terms:
+    # Light seed-keyword enrichment (avoid overfitting; limit to 2 terms).
+    if seed_data:
+        strong_exp_tokens = exp_facet_tokens - _SEED_KEYWORD_WEAK_TOKENS
+        exp_seed_keywords = [
+            kw for kw in _seed_keyword_terms(seed_data)
+            if _tokenize(kw) & strong_exp_tokens
+        ]
+        exp_seed_keywords = _dedupe_keep_order(exp_seed_keywords)
+        added_keywords: list[str] = []
+        for kw in exp_seed_keywords:
+            norm = _normalize_term(kw).lower()
+            if not norm or any(norm in t.lower() for t in exp_terms):
+                continue
+            formatted = _format_exp_text(kw)
+            if formatted:
+                added_keywords.append(formatted)
+            if len(added_keywords) >= 2:
+                break
+        if added_keywords:
+            exp_terms = _dedupe_keep_order(exp_terms + added_keywords)
+
+    # Add a couple of short, facet-aligned phrases from seed titles.
+    pop_title_phrases = _seed_title_phrases(seed_data, pop_facet_tokens, max_phrases=1)
+    if pop_title_phrases:
+        pop_terms_extra = [_format_tiab(t) for t in pop_title_phrases if _format_tiab(t)]
+        if pop_terms_extra:
+            pop_terms = _dedupe_keep_order(pop_terms + pop_terms_extra)
+
+    exp_title_phrases = _seed_title_phrases(seed_data, exp_facet_tokens, max_phrases=2)
+    if exp_title_phrases:
+        exp_terms_extra = [_format_exp_text(t) for t in exp_title_phrases if _format_exp_text(t)]
+        if exp_terms_extra:
+            exp_terms = _dedupe_keep_order(exp_terms + exp_terms_extra)
+
+    if not pop_block and not exp_terms:
         return ""
-    if pop_terms and not exp_terms:
-        block = "(" + " OR ".join(pop_terms) + ")"
-        return f"{block} NOT (animals[MeSH] NOT humans[MeSH])"
-    if exp_terms and not pop_terms:
+    if pop_block and not exp_terms:
+        return f"{pop_block} NOT (animals[MeSH] NOT humans[MeSH])"
+    if exp_terms and not pop_block:
         block = "(" + " OR ".join(exp_terms) + ")"
         return f"{block} NOT (animals[MeSH] NOT humans[MeSH])"
-
-    pop_block = "(" + " OR ".join(pop_terms) + ")"
     exp_block = "(" + " OR ".join(exp_terms) + ")"
     return f"{pop_block} AND {exp_block} NOT (animals[MeSH] NOT humans[MeSH])"
 
@@ -823,19 +1165,13 @@ def _build_symptom_review_query(extracted_json: dict) -> str:
         + _get_nested_list(extracted_json, "proxy_terms", "intervention_or_exposure")
     )
 
-    # Disease block
-    disease_mesh = [
-        t for t in pop_mesh_raw
-        if any(k in t.lower() for k in ("colorectal", "colonic", "rectal", "neoplasm", "cancer"))
-    ] or pop_mesh_raw
+    # Disease block (exclude age qualifiers)
+    disease_mesh = [t for t in pop_mesh_raw if t.lower() not in _DEMOGRAPHIC_MESH]
     disease_text = [t for t in pop_text_raw if not _looks_like_age_term(t)]
-    disease_text += ["colorectal cancer", "colon cancer", "rectal cancer", "colorectal neoplasm*"]
-    if any("colorectal" in t.lower() for t in disease_text):
-        disease_text.append("CRC")
 
     disease_terms = _dedupe_keep_order(
-        [_format_mesh(t) for t in disease_mesh[:4]]
-        + [_format_tiab(t) for t in disease_text[:8]]
+        [_format_mesh(t) for t in disease_mesh[:6]]
+        + [_format_tiab(t) for t in disease_text[:10]]
     )
     disease_terms = [t for t in disease_terms if t]
 
@@ -859,9 +1195,9 @@ def _build_symptom_review_query(extracted_json: dict) -> str:
     # Symptom/presentation block
     symptom_mesh = [
         t for t in int_mesh_raw
-        if any(k in t.lower() for k in ("diagnos", "hematochezia", "pain", "anemia", "anaemia", "delay"))
+        if any(k in t.lower() for k in ("diagnos", "symptom", "pain", "anemia", "anaemia", "delay", "presentation"))
     ]
-    symptom_mesh += ["Diagnosis", "Early Detection of Cancer"]
+    symptom_mesh += ["Diagnosis"]
     symptom_text = list(int_text_raw) + [
         "diagnos*",
         "detect*",
@@ -886,6 +1222,97 @@ def _build_symptom_review_query(extracted_json: dict) -> str:
     return f"(({age_block} AND {disease_block}) AND {symptom_block}) NOT (animals[MeSH] NOT humans[MeSH])"
 
 
+def _filter_diet_refinement(refined_query: str, structured_query: str) -> str:
+    """Remove non-diet terms introduced by refinement in diet reviews."""
+    refined_core, suffix = _strip_animal_filter(refined_query)
+    structured_core, _ = _strip_animal_filter(structured_query)
+
+    refined_blocks = _split_top_level(refined_core, " AND ")
+    structured_blocks = _split_top_level(structured_core, " AND ")
+    if len(refined_blocks) < 2 or len(structured_blocks) < 2:
+        return refined_query
+
+    pop_block = refined_blocks[0]
+    exp_block = refined_blocks[1]
+
+    def _strip_parens(block: str) -> str:
+        block = block.strip()
+        if block.startswith("(") and block.endswith(")"):
+            return block[1:-1].strip()
+        return block
+
+    exp_terms_refined = _split_top_level(_strip_parens(exp_block), " OR ")
+    exp_terms_struct = _split_top_level(_strip_parens(structured_blocks[1]), " OR ")
+    orig_norms = {
+        _normalize_query_term(t) for t in exp_terms_struct if _normalize_query_term(t)
+    }
+
+    filtered_terms: list[str] = []
+    for term in exp_terms_refined:
+        norm = _normalize_query_term(term)
+        if not norm:
+            continue
+        if norm in orig_norms:
+            filtered_terms.append(term)
+            continue
+        tokens = _tokenize(norm)
+        if tokens & _DIET_ALLOWED_TOKENS:
+            filtered_terms.append(term)
+
+    if not filtered_terms:
+        return structured_query
+
+    exp_block_clean = "(" + " OR ".join(filtered_terms) + ")"
+    return f"{pop_block} AND {exp_block_clean}{suffix}"
+
+
+def _filter_refinement_by_tokens(
+    refined_query: str,
+    structured_query: str,
+    allowed_tokens: set[str],
+) -> str:
+    refined_core, suffix = _strip_animal_filter(refined_query)
+    structured_core, _ = _strip_animal_filter(structured_query)
+
+    refined_blocks = _split_top_level(refined_core, " AND ")
+    structured_blocks = _split_top_level(structured_core, " AND ")
+    if len(refined_blocks) < 2 or len(structured_blocks) < 2:
+        return refined_query
+
+    pop_block = refined_blocks[0]
+    exp_block = refined_blocks[1]
+
+    def _strip_parens(block: str) -> str:
+        block = block.strip()
+        if block.startswith("(") and block.endswith(")"):
+            return block[1:-1].strip()
+        return block
+
+    exp_terms_refined = _split_top_level(_strip_parens(exp_block), " OR ")
+    exp_terms_struct = _split_top_level(_strip_parens(structured_blocks[1]), " OR ")
+    orig_norms = {
+        _normalize_query_term(t) for t in exp_terms_struct if _normalize_query_term(t)
+    }
+
+    filtered_terms: list[str] = []
+    for term in exp_terms_refined:
+        norm = _normalize_query_term(term)
+        if not norm:
+            continue
+        if norm in orig_norms:
+            filtered_terms.append(term)
+            continue
+        tokens = _tokenize(norm)
+        if tokens & allowed_tokens:
+            filtered_terms.append(term)
+
+    if not filtered_terms:
+        return structured_query
+
+    exp_block_clean = "(" + " OR ".join(filtered_terms) + ")"
+    return f"{pop_block} AND {exp_block_clean}{suffix}"
+
+
 def _clean_controlled_vocab_terms(extracted_json: dict) -> None:
     controlled = extracted_json.get("controlled_vocabulary_terms")
     if not isinstance(controlled, dict):
@@ -901,6 +1328,8 @@ def _clean_controlled_vocab_terms(extracted_json: dict) -> None:
             if not isinstance(term, str):
                 continue
             lower = term.strip().lower()
+            if lower in _ALWAYS_DROP_MESH:
+                continue
             if lower in _BROAD_MESH_DROP_IF_MULTIPLE:
                 continue
             if "/surgery" in lower and ("disease" in lower or "colon" in lower):
@@ -1173,14 +1602,11 @@ search query.  Your goals are to (1) catch missing seed papers and \
 ## Draft query
 {draft_query}
 
-## Seed papers (known included studies that the query MUST retrieve)
-{seed_abstracts}
+## Seed-paper titles (known included studies that the query MUST retrieve)
+{seed_titles}
 
 ## Seed-paper MeSH terms
 {seed_mesh}
-
-## Seed-paper author keywords
-{seed_keywords}
 
 ## Step 1 — Fix structural errors FIRST:
 a) Every free-text term MUST have [tiab].  If you see bare terms like
@@ -1191,7 +1617,7 @@ b) Demographic MeSH ("Young Adult"[MeSH], "Adolescent"[MeSH], etc.) must
    single OR clause, or move to a separate AND block.
 
 ## Step 2 — Check seed paper coverage:
-For each seed paper, check whether the query would plausibly retrieve it.
+For each seed paper title, check whether the query would plausibly retrieve it.
 If a seed paper might be missed, add ONLY the minimum terms needed.
 Typical fixes (add at most 1-3 terms total):
 - A parent MeSH heading (e.g., "Colorectal Surgery"[MeSH])
@@ -1249,11 +1675,19 @@ class QueryGenerator:
         seed_papers_dir: Path = _DEFAULT_SEED_DIR,
         max_seeds: int | None = 3,
         rng_seed: int | None = None,
+        cache_dir: Path = Path(".cache"),
+        entrez_email: str | None = None,
+        entrez_api_key: str | None = None,
+        enable_mesh_expansion: bool = True,
     ):
         self.client = client
         self.seed_papers_dir = seed_papers_dir
         self.max_seeds = max_seeds
         self.rng_seed = rng_seed
+        self.mesh_cache = MeshExpansionCache(cache_dir)
+        self.mesh_expander = None
+        if enable_mesh_expansion and entrez_email and entrez_email != "user@example.com":
+            self.mesh_expander = MeSHExpander(entrez_email, entrez_api_key)
 
     # ── public API ─────────────────────────────────────────────────────
 
@@ -1286,31 +1720,38 @@ class QueryGenerator:
             max_seeds=self.max_seeds,
             rng_seed=self.rng_seed,
         )
-        if _looks_like_diet_review(extracted_json) and (self.max_seeds or 0) < 5:
-            seed_data = load_seed_papers(
-                self.seed_papers_dir, study_id, study_name,
-                max_seeds=5,
-                rng_seed=self.rng_seed,
-            )
-
         # ── Step 2: Query composition ───────────────────────────────────
         # For early-onset cancer symptom/presentation reviews we use a
         # deterministic high-recall 3-block template to avoid LLM drift.
         if _looks_like_symptom_review(extracted_json):
             logger.info("Detected symptom/presentation review — using rule-based 3-block composer")
             query = _build_symptom_review_query(extracted_json)
-            prompt_version = "symptom_rule_v1"
-        elif _looks_like_nutrition_intervention(extracted_json):
-            logger.info("Detected perioperative nutrition review — using rule-based nutrition composer")
-            query = _build_nutrition_intervention_query(extracted_json)
-            prompt_version = "nutrition_rule_v1"
-        elif _looks_like_diet_review(extracted_json):
-            logger.info("Detected diet/exposure review — using rule-based diet composer")
-            query = _build_diet_review_query(extracted_json, seed_data)
-            prompt_version = "diet_rule_v1"
+            prompt_version = "symptom_rule_v2"
         else:
-            query = _build_structured_query(extracted_json, seed_data)
-            prompt_version = "structured_seed_v1"
+            query = _build_structured_query(
+                extracted_json,
+                seed_data,
+                mesh_expander=self.mesh_expander,
+                mesh_cache=self.mesh_cache,
+            )
+            prompt_version = "structured_seed_v2"
+            structured_query = query
+            if query and seed_data and seed_data.get("papers"):
+                if _looks_like_diet_review(extracted_json):
+                    refined = self._refine_query_llm(query, seed_data, tokens)
+                    if refined:
+                        refined = _tag_bare_terms(refined)
+                        query = _filter_diet_refinement(refined, structured_query)
+                        prompt_version = "structured_seed_v2_refine_diet"
+                else:
+                    refined = self._refine_query_llm(query, seed_data, tokens)
+                    if refined:
+                        refined = _tag_bare_terms(refined)
+                        exp_core_raw = _get_nested_list(extracted_json, "core_concepts", "intervention_or_exposure")
+                        exp_phrase_raw = _get_nested_list(extracted_json, "exact_phrases", "intervention_or_exposure")
+                        allowed_tokens = _tokenize(" ".join(exp_core_raw + exp_phrase_raw))
+                        query = _filter_refinement_by_tokens(refined, structured_query, allowed_tokens)
+                        prompt_version = "structured_seed_v2_refine"
             if not query:
                 query = self._compose_query_llm(extracted_json, seed_data, tokens)
                 prompt_version = "llm_seed_v2"
@@ -1431,14 +1872,12 @@ class QueryGenerator:
         Returns the refined query, or the original on failure.
         """
         seed_mesh = summarise_seed_mesh(seed_data)
-        seed_keywords = _seed_paper_keywords(seed_data)
-        seed_abstracts = _seed_paper_abstracts(seed_data)
+        seed_titles = _seed_paper_titles(seed_data)
 
         prompt = _REFINE_QUERY_PROMPT.format(
             draft_query=draft_query,
             seed_mesh=seed_mesh,
-            seed_keywords=seed_keywords,
-            seed_abstracts=seed_abstracts,
+            seed_titles=seed_titles,
         )
 
         try:
