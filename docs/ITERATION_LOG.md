@@ -74,3 +74,26 @@ Reason:
 Mistakes / Lessons:
 
 - Adding broad MeSH (e.g., `Digestive System Surgical Procedures`, `Colon`) can explode result counts without improving recall; generic MeSH now filtered unless explicitly signaled in the review text.
+
+## 2026-03-12 Change 4 (Diet Recall Broadening + Appendiceal Coverage)
+
+Files:
+
+- `src/llm/query_generator.py`
+
+What changed:
+
+- Diet composer now:
+  - Adds `Appendiceal Diseases`/`Appendix` MeSH and `appendiceal` text when appendicitis is the target condition.
+  - Prioritizes `fiber`/`fibre` (broad text words) to match diet studies that use unqualified fibre terms.
+  - Uses `[tw]` for core diet/fiber terms to slightly broaden matching beyond title/abstract.
+  - Expands diet seed usage to 5 papers (still limited) for high-heterogeneity lifestyle reviews.
+- Controlled vocabulary cleanup removes generic `/surgery` disease headings when more specific terms exist.
+
+Reason:
+
+- Diet/appendicitis reviews are heterogeneous; broader diet/fiber matching improves recall without relying on included-studies feedback.
+
+Mistakes / Lessons:
+
+- Overly broad subheading terms (e.g., `Colonic Diseases/surgery`) caused large result inflation; additional cleanup rules added.
