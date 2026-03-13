@@ -47,9 +47,13 @@ class LLMResponse:
 class OpenAIClient:
     """Wrapper for OpenAI API with retry logic and file handling."""
 
+    # Models that do not support the temperature parameter
+    NO_TEMPERATURE_MODELS = {"gpt-5.3-chat-latest"}
+
     def __init__(self, api_key: str, model: str = "gpt-5-mini-2025-08-07"):
         self.client = OpenAI(api_key=api_key)
         self.model = model
+        self._supports_temperature = model not in self.NO_TEMPERATURE_MODELS
 
     def _encode_file_base64(self, file_path: Path) -> str:
         """Encode a file to base64."""
@@ -172,8 +176,9 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0,
         }
+        if self._supports_temperature:
+            kwargs["temperature"] = 0
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 
@@ -220,8 +225,9 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0,
         }
+        if self._supports_temperature:
+            kwargs["temperature"] = 0
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 
@@ -255,8 +261,9 @@ class OpenAIClient:
         kwargs = {
             "model": self.model,
             "messages": [{"role": "user", "content": full_prompt}],
-            "temperature": 0,
         }
+        if self._supports_temperature:
+            kwargs["temperature"] = 0
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
 

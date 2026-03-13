@@ -84,6 +84,44 @@ uv run python compare_query.py 34 --show-human
 
 The script prompts you to paste a PubMed query in the terminal (enter a blank line when done), then runs it against PubMed and displays recall, precision, and NNR.
 
+### Generate Query (Two-Step Prompt)
+
+Generate a PubMed query from a PROSPERO PDF and evaluate it against the human strategy:
+
+```bash
+# Generate, evaluate, and compare against human strategy
+uv run python generate_query.py 34
+
+# Skip human comparison
+uv run python generate_query.py 34 --no-human
+
+# Extract the systematic review plan only (no query generation)
+uv run python generate_query.py 34 --extract
+
+# Run multiple studies at once (prints per-study tables + summary)
+uv run python generate_query.py 34 35 36
+
+# Generate N queries per study and merge PubMed results (union of PMIDs)
+uv run python generate_query.py 34 -n 3
+
+# Repeat the prompt twice in a single message for emphasis
+uv run python generate_query.py 34 --double-prompt
+
+# Combine options
+uv run python generate_query.py 34 35 -n 3 --double-prompt --no-human
+```
+
+The script runs two LLM calls: first extracting the structured plan from the PDF, then generating a query from that plan. The model and prompts are configured at the top of `generate_query.py` (`MODEL`, `EXTRACT_PROMPT`, `QUERY_PROMPT`).
+
+| Flag | Description |
+|------|-------------|
+| `-n N` | Run query generation N times per study and merge results (union of PMIDs). LLM calls run in parallel. |
+| `--double-prompt` | Repeat the full query prompt twice in a single message for emphasis. |
+| `--no-human` | Skip human strategy comparison. |
+| `--extract` | Extract the systematic review plan only (no query generation). |
+
+When multiple studies are provided, a summary table is printed at the end with aggregate recall, precision, NNR, and human baseline columns.
+
 ### Additional Options
 
 | Flag | Description |

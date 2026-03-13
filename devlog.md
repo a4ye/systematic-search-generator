@@ -357,6 +357,57 @@ Instead of one shotting the query, I will now try a multi step process where fir
 2. it does mesh expansion
 3. and then refines the query using  the seed papers
 
+best result so far:
+Study Comparison Summary                            
+┏━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━┓
+┃             ┃             ┃            ┃        Human ┃       Human ┃        ┃
+┃ Study       ┃ LLM Results ┃ LLM Recall ┃      Results ┃      Recall ┃ Winner ┃
+┡━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━┩
+│ 34 - Lu     │        4300 │     100.0% │         1728 │       90.0% │  LLM   │
+│ 2022        │             │            │              │             │        │
+│ 43 - Zou    │        3960 │     100.0% │          384 │       90.9% │  LLM   │
+│ 2024        │             │            │              │             │        │
+│ 76 -        │         718 │     100.0% │          496 │       97.0% │ Human  │
+│ Passone     │             │            │              │             │        │
+│ 2020        │             │            │              │             │        │
+│ 77 -        │        3718 │     100.0% │          994 │      100.0% │  Tie   │
+│ Bjursell    │             │            │              │             │        │
+│ 2025        │             │            │              │             │        │
+│ 88 - Van    │        1870 │      92.8% │         2414 │       94.0% │  Tie   │
+│ Raath 2020  │             │            │              │             │        │
+│ 92 - Pitesa │        1026 │      87.5% │          335 │       87.5% │ Human  │
+│ 2025        │             │            │              │             │        │
+│ 101 - Xiao  │         596 │      93.3% │           32 │       93.3% │ Human  │
+│ 2025        │             │            │              │             │        │
+│ 110 - Demb  │        2632 │      60.3% │        10439 │       98.6% │ Human  │
+│ 2024        │             │            │              │             │        │
+│ 118 - Shiha │        9366 │      81.2% │          231 │       87.5% │ Human  │
+│ 2024        │             │            │              │             │        │
+│ 131 -       │        1715 │      90.0% │          271 │       90.0% │ Human  │
+│ Kanjee 2024 │             │            │              │             │        │
+│ 143 -       │           — │          — │         1714 │       91.7% │   —    │
+│ Boggiss     │             │            │              │             │        │
+│ 2020        │             │            │              │             │        │
+└─────────────┴─────────────┴────────────┴──────────────┴─────────────┴────────┘
+
+════════════════════════════════════════════════════════════
+AGGREGATE COMPARISON (11 studies)
+════════════════════════════════════════════════════════════
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃ Metric               ┃   LLM ┃ Human ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│ Mean Recall (PubMed) │ 90.5% │ 92.9% │
+│ Mean Precision       │ 1.66% │ 8.02% │
+└──────────────────────┴───────┴───────┘
+
+Studies where LLM wins:   2 (20.0%)
+Studies where Human wins: 6 (60.0%)
+Ties:                     2
+
+Incomplete comparisons: 1
+- 143 - Boggiss 2020
+  ═══════════════
+
 more ideas:
 - vector embeddinds / semantics of terms
 - maybe find most similar terms to the seed papers and make sure they are included in the query
