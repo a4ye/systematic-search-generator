@@ -28,7 +28,7 @@ QUERY_PROMPT = """\
 Given a systematic review plan, generate a PubMed Boolean search query optimized for systematic review searching (target roughly <20,000 PubMed results).
 
 Goal:
-Maximize sensitivity while maintaining reasonable precision (<50,000 PubMed results).
+Maximize sensitivity while great reasonable precision.
 
 Instructions:
 
@@ -105,6 +105,9 @@ class StudyResult:
     study_name: str
     llm_metrics: object  # MetricsResult
     human_metrics: object | None  # MetricsResult or None
+    llm_queries: list[str] | None = None
+    merged_query: str | None = None
+    human_query: str | None = None
     error: str | None = None
 
 
@@ -119,7 +122,7 @@ def _calculate_total_steps(n_runs: int, include_human: bool) -> int:
       5. Evaluate LLM metrics
       6-8. (if human) Extract/load strategy, fetch PubMed, evaluate metrics
     """
-    total = 2 + n_runs + n_runs + 1  # load + extract + generate + fetch + evaluate
+    total = 2 + n_runs + 1 + 1  # load + extract + generate(n) + fetch(1) + evaluate
     if include_human:
         total += 3  # strategy extract + fetch + evaluate
     return total
@@ -525,57 +528,20 @@ def run_study(
 
             return search_results
 
-        # Execute each generated query and merge results (union of PMIDs)
-        all_results: list[PubMedSearchResults] = []
-        seen_queries: dict[str, PubMedSearchResults] = {}
-        for i, q in enumerate(generated_queries):
-            label = f"Query {i + 1}/{n_runs}"
-            if n_runs > 1:
-                log.print(f"\n[dim]Fetching results for query {i + 1}/{n_runs}...[/dim]")
-                log.print(f"[dim]  {q[:100]}{'...' if len(q) > 100 else ''}[/dim]")
-            if q in seen_queries:
-                log.print("[dim]  Duplicate query, reusing results[/dim]")
-                step(f"{label}: duplicate")
-                all_results.append(seen_queries[q])
-            else:
-                result = fetch_or_cached(q, label)
-                if result is None:
-                    log.print(f"[red]Skipping query {i + 1} (too broad)[/red]")
-                    continue
-                seen_queries[q] = result
-                all_results.append(result)
+        # Build final query: OR together unique queries if n > 1
+        unique_queries = list(dict.fromkeys(generated_queries))  # preserve order, dedupe
+        if len(unique_queries) > 1:
+            final_query = " OR ".join(f"({q})" for q in unique_queries)
+            merged_query = final_query
+        else:
+            final_query = unique_queries[0]
+            merged_query = None
 
-        if not all_results:
+        # Execute the single (possibly merged) query against PubMed
+        llm_results = fetch_or_cached(final_query, "LLM query")
+        if llm_results is None:
             log.print("[red]No valid query results[/red]")
             return None
-
-        if n_runs == 1 or len(all_results) == 1:
-            llm_results = all_results[0]
-        else:
-            # Merge: union of PMIDs and DOIs across all runs
-            merged_pmid_map: dict[str, dict] = {}
-            merged_doi_map: dict[str, dict] = {}
-            for result in all_results:
-                for pmid, info in result.pmid_map.items():
-                    if pmid not in merged_pmid_map:
-                        merged_pmid_map[pmid] = info
-                for doi, info in result.doi_map.items():
-                    if doi not in merged_doi_map:
-                        merged_doi_map[doi] = info
-
-            merged_pmids = list(merged_pmid_map.keys())
-            merged_doi_to_pmid = {doi: info["pmid"] for doi, info in merged_doi_map.items()}
-
-            llm_results = PubMedSearchResults.from_cached(
-                query=f"MERGED({n_runs} runs)",
-                pmids=merged_pmids,
-                result_count=len(merged_pmids),
-                doi_to_pmid=merged_doi_to_pmid,
-            )
-
-            per_query_counts = [r.result_count for r in all_results]
-            log.print(f"\n[dim]Per-query result counts: {per_query_counts}[/dim]")
-            log.print(f"[dim]Merged unique PMIDs: {len(merged_pmids):,}[/dim]")
 
         progress.update(task_id, description="Checking PubMed indexing (LLM)...")
         llm_metrics = calculate_metrics_with_pubmed_check(
@@ -589,13 +555,13 @@ def run_study(
 
         # Evaluate human strategy (default, skip with --no-human)
         human_metrics = None
+        human_query = None
         if include_human:
             from src.cache.strategy_cache import StrategyCache
 
             strategy_cache = StrategyCache(config.cache_dir)
             cached = strategy_cache.get(study.search_strategy_docx)
 
-            human_query = None
             if cached:
                 log.print("[dim]Using cached human strategy[/dim]")
                 human_query = cached.query
@@ -642,6 +608,9 @@ def run_study(
         study_name=study.name,
         llm_metrics=llm_metrics,
         human_metrics=human_metrics,
+        llm_queries=generated_queries,
+        merged_query=merged_query,
+        human_query=human_query,
     )
 
 
@@ -650,7 +619,7 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     results_dir = Path("results")
     results_dir.mkdir(exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     study_ids = "_".join(r.study_id for r in results)
     filename = f"results_{study_ids}_{timestamp}.md"
     filepath = results_dir / filename
@@ -658,7 +627,7 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     lines: list[str] = []
     lines.append(f"# Query Generation Results")
     lines.append(f"")
-    lines.append(f"- **Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- **Date**: {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
     lines.append(f"- **Model**: {MODEL}")
     lines.append(f"- **N runs**: {args.n}")
     lines.append(f"- **Double prompt**: {args.double_prompt}")
@@ -692,10 +661,10 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
         lines.append(f"## Summary")
         lines.append(f"")
         lines.append(
-            "| Study | Results | Recall | Recall (PM) | Precision | NNR | H-Recall | H-Results | H-Precision |"
+            "| Study | Results | Recall | Recall (PM) | Precision | NNR | H-Recall | H-Recall (PM) | H-Results | H-Precision |"
         )
         lines.append(
-            "|-------|---------|--------|-------------|-----------|-----|----------|-----------|-------------|"
+            "|-------|---------|--------|-------------|-----------|-----|----------|---------------|-----------|-------------|"
         )
 
         for r in results:
@@ -707,11 +676,12 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             precision_str = f"{m.precision * 100:.2f}%"
             nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
             h_recall_str = f"{h.recall_overall * 100:.1f}% ({h.found}/{h.total_included})" if h else "—"
+            h_recall_pm_str = f"{h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count})" if h else "—"
             h_results_str = str(h.total_results) if h else "—"
             h_precision_str = f"{h.precision * 100:.2f}%" if h else "—"
             lines.append(
                 f"| {label} | {m.total_results} | {recall_str} | {recall_pm_str} | {precision_str} | {nnr_str} "
-                f"| {h_recall_str} | {h_results_str} | {h_precision_str} |"
+                f"| {h_recall_str} | {h_recall_pm_str} | {h_results_str} | {h_precision_str} |"
             )
 
         # Averages
@@ -729,20 +699,49 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             h_n = len(human_with)
             h_avg_recall = sum(r.human_metrics.recall_overall for r in human_with) / h_n * 100
             h_avg_recall_str = f"{h_avg_recall:.1f}%"
+            h_avg_recall_pm = sum(r.human_metrics.recall_pubmed_only for r in human_with) / h_n * 100
+            h_avg_recall_pm_str = f"{h_avg_recall_pm:.1f}%"
             h_avg_results_str = str(sum(r.human_metrics.total_results for r in human_with) // h_n)
             h_avg_precision = sum(r.human_metrics.precision for r in human_with) / h_n * 100
             h_avg_precision_str = f"{h_avg_precision:.2f}%"
         else:
             h_avg_recall_str = "—"
+            h_avg_recall_pm_str = "—"
             h_avg_results_str = "—"
             h_avg_precision_str = "—"
 
         lines.append(
             f"| **AVG** | **{avg_results}** | **{avg_recall:.1f}%** | **{avg_recall_pm:.1f}%** "
             f"| **{avg_precision:.2f}%** | **{avg_nnr_str}** | **{h_avg_recall_str}** "
-            f"| **{h_avg_results_str}** | **{h_avg_precision_str}** |"
+            f"| **{h_avg_recall_pm_str}** | **{h_avg_results_str}** | **{h_avg_precision_str}** |"
         )
         lines.append(f"")
+
+    lines.append(f"## Queries")
+    lines.append(f"")
+    for r in results:
+        lines.append(f"### Study {r.study_id} - {r.study_name}")
+        lines.append(f"")
+        if r.llm_queries:
+            for i, q in enumerate(r.llm_queries):
+                label = f"LLM Query" if len(r.llm_queries) == 1 else f"LLM Query {i + 1}"
+                lines.append(f"**{label}:**")
+                lines.append(f"```")
+                lines.append(q)
+                lines.append(f"```")
+                lines.append(f"")
+        if r.merged_query:
+            lines.append(f"**Merged Query (OR union):**")
+            lines.append(f"```")
+            lines.append(r.merged_query)
+            lines.append(f"```")
+            lines.append(f"")
+        if r.human_query:
+            lines.append(f"**Human Query:**")
+            lines.append(f"```")
+            lines.append(r.human_query)
+            lines.append(f"```")
+            lines.append(f"")
 
     filepath.write_text("\n".join(lines))
     return filepath
