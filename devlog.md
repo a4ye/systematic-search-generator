@@ -372,6 +372,8 @@ more ideas:
 - use pubmed api to find papers similar to the seed papers (it is already built into the api) and use as additional seed papers, or to make sure they are included in the query
 - using hedges (medical libarians use them)
 
+- new idea: multiple narrow queries and then merge the results, instead of one broad query, which might improve precision while maintaining recall
+
 
 ## Next Steps
 

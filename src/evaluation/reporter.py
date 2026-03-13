@@ -185,10 +185,10 @@ class Reporter:
         # Print both queries
         if result.llm_query:
             self.console.print(f"\n[bold]LLM Query:[/bold]")
-            self.console.print(result.llm_query)
+            self.console.print(result.llm_query, markup=False, highlight=False)
         if result.human_query:
             self.console.print(f"\n[bold]Human Query:[/bold]")
-            self.console.print(result.human_query)
+            self.console.print(result.human_query, markup=False, highlight=False)
 
         self.console.print()
 

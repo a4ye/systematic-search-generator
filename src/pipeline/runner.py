@@ -27,10 +27,11 @@ from src.pubmed.search_executor import PubMedExecutor, PubMedSearchResults
 class PipelineRunner:
     """Main orchestrator for the testing pipeline."""
 
-    def __init__(self, config: PipelineConfig, max_seeds: int | None = 3, rng_seed: int | None = None):
+    def __init__(self, config: PipelineConfig, max_seeds: int | None = 3, rng_seed: int | None = None, concise: bool = False):
         self.config = config
         self.max_seeds = max_seeds
         self.rng_seed = rng_seed
+        self.concise = concise
         self.console = Console()
         self.reporter = Reporter(self.console)
 
@@ -44,6 +45,9 @@ class PipelineRunner:
             api_key=config.entrez_api_key,
             batch_size=config.pubmed_batch_size,
         )
+
+        # Verbose logging helper
+        self._log = self.console.print if not concise else lambda *a, **kw: None
 
         # LLM components (initialized lazily to allow human-only mode)
         self._openai_client: OpenAIClient | None = None
@@ -154,24 +158,24 @@ class PipelineRunner:
             # Use pre-generated query or generate new one
             if pregenerated_query is not None:
                 generated = pregenerated_query
-                self.console.print(f"  [dim]Using pre-generated LLM query...[/dim]")
+                self._log(f"  [dim]Using pre-generated LLM query...[/dim]")
             else:
                 t0 = time.time()
-                self.console.print(f"  [dim]Generating LLM query (Extract → Compose → Refine)...[/dim]")
+                self._log(f"  [dim]Generating LLM query (Extract → Compose → Refine)...[/dim]")
                 generated = self.query_generator.generate_query(
                     study.prospero_pdf
                 )
-                self.console.print(f"  [dim]  -> LLM generation: {time.time() - t0:.1f}s[/dim]")
+                self._log(f"  [dim]  -> LLM generation: {time.time() - t0:.1f}s[/dim]")
 
             result.llm_query = generated.query
 
             # Print pipeline output
             if generated.extracted_json is not None:
-                self.console.print(f"\n  [bold]Step 1 — Extracted JSON:[/bold]")
-                self.console.print(json.dumps(generated.extracted_json, indent=2, ensure_ascii=False))
-            self.console.print(f"\n  [bold]Steps 2+3 — Composed & Refined Query:[/bold]")
-            self.console.print(generated.query)
-            self.console.print()
+                self._log(f"\n  [bold]Step 1 — Extracted JSON:[/bold]")
+                self._log(json.dumps(generated.extracted_json, indent=2, ensure_ascii=False))
+            self._log(f"\n  [bold]Steps 2+3 — Composed & Refined Query:[/bold]")
+            self._log(generated.query, markup=False, highlight=False)
+            self._log()
 
             if not generated.is_valid:
                 result.llm_error = f"Invalid query: {', '.join(generated.validation_errors)}"
@@ -180,7 +184,7 @@ class PipelineRunner:
 
             # Check result count first
             t0 = time.time()
-            self.console.print(f"  [dim]Executing LLM query on PubMed...[/dim]")
+            self._log(f"  [dim]Executing LLM query on PubMed...[/dim]")
             result_count = self.pubmed.count_results(generated.query)
 
             if result_count > 50000:
@@ -193,11 +197,11 @@ class PipelineRunner:
                 generated.query,
                 max_results=self.config.max_pubmed_results,
             )
-            self.console.print(f"  [dim]  -> PubMed fetch ({search_results.result_count} results): {time.time() - t0:.1f}s[/dim]")
+            self._log(f"  [dim]  -> PubMed fetch ({search_results.result_count} results): {time.time() - t0:.1f}s[/dim]")
 
             # Calculate metrics with PubMed indexing check
             t0 = time.time()
-            self.console.print(f"  [dim]Checking PubMed indexing for missed studies...[/dim]")
+            self._log(f"  [dim]Checking PubMed indexing for missed studies...[/dim]")
             result.llm_metrics = calculate_metrics_with_pubmed_check(
                 search_results,
                 included_studies,
@@ -205,7 +209,7 @@ class PipelineRunner:
                 rate_delay=0.1 if self.config.entrez_api_key else 0.34,
                 index_cache=self.index_cache,
             )
-            self.console.print(f"  [dim]  -> Indexing check: {time.time() - t0:.1f}s[/dim]")
+            self._log(f"  [dim]  -> Indexing check: {time.time() - t0:.1f}s[/dim]")
 
         except Exception as e:
             result.llm_error = str(e)
@@ -228,16 +232,16 @@ class PipelineRunner:
         try:
             # Extract strategy
             t0 = time.time()
-            self.console.print(f"  [dim]Extracting human strategy...[/dim]")
+            self._log(f"  [dim]Extracting human strategy...[/dim]")
             extracted = self.strategy_extractor.extract_strategy(
                 study.search_strategy_docx,
                 force_refresh=refresh_cache,
             )
 
             if extracted.from_cache:
-                self.console.print(f"  [dim](using cached strategy)[/dim]")
+                self._log(f"  [dim](using cached strategy)[/dim]")
             else:
-                self.console.print(f"  [dim]  -> Strategy extraction: {time.time() - t0:.1f}s[/dim]")
+                self._log(f"  [dim]  -> Strategy extraction: {time.time() - t0:.1f}s[/dim]")
 
             if not extracted.query:
                 result.human_error = extracted.error or "Failed to extract query"
@@ -248,7 +252,7 @@ class PipelineRunner:
             # Check query cache first
             cached_result = self.query_cache.get(extracted.query)
             if cached_result and not refresh_cache:
-                self.console.print(f"  [dim]Using cached PubMed results...[/dim]")
+                self._log(f"  [dim]Using cached PubMed results...[/dim]")
                 search_results = PubMedSearchResults.from_cached(
                     query=extracted.query,
                     pmids=cached_result.pmids,
@@ -258,12 +262,12 @@ class PipelineRunner:
             else:
                 # Execute on PubMed with fast method
                 t0 = time.time()
-                self.console.print(f"  [dim]Executing human query on PubMed...[/dim]")
+                self._log(f"  [dim]Executing human query on PubMed...[/dim]")
                 search_results = self.pubmed.execute_query_fast(
                     extracted.query,
                     max_results=self.config.max_pubmed_results,
                 )
-                self.console.print(f"  [dim]  -> PubMed fetch ({search_results.result_count} results): {time.time() - t0:.1f}s[/dim]")
+                self._log(f"  [dim]  -> PubMed fetch ({search_results.result_count} results): {time.time() - t0:.1f}s[/dim]")
                 # Cache the results
                 pmids = list(search_results.pmid_map.keys())
                 doi_to_pmid = {
@@ -275,7 +279,7 @@ class PipelineRunner:
 
             # Calculate metrics with PubMed indexing check
             t0 = time.time()
-            self.console.print(f"  [dim]Checking PubMed indexing for missed studies...[/dim]")
+            self._log(f"  [dim]Checking PubMed indexing for missed studies...[/dim]")
             result.human_metrics = calculate_metrics_with_pubmed_check(
                 search_results,
                 included_studies,
@@ -283,7 +287,7 @@ class PipelineRunner:
                 rate_delay=0.1 if self.config.entrez_api_key else 0.34,
                 index_cache=self.index_cache,
             )
-            self.console.print(f"  [dim]  -> Indexing check: {time.time() - t0:.1f}s[/dim]")
+            self._log(f"  [dim]  -> Indexing check: {time.time() - t0:.1f}s[/dim]")
 
         except Exception as e:
             result.human_error = str(e)
@@ -315,7 +319,7 @@ class PipelineRunner:
             studies_with_prospero = [s for s in studies if s.prospero_pdf]
             if studies_with_prospero:
                 t0 = time.time()
-                self.console.print(
+                self._log(
                     f"[dim]Generating {len(studies_with_prospero)} LLM queries "
                     f"(Extract → Compose → Refine, max {max_llm_workers} workers)...[/dim]"
                 )
@@ -328,7 +332,7 @@ class PipelineRunner:
                     pregenerated_queries[study.study_id] = query
                     if not query.is_valid:
                         self.console.print(f"[red]  {study.study_id}: {', '.join(query.validation_errors)}[/red]")
-                self.console.print(f"[dim]LLM query generation complete in {time.time() - t0:.1f}s[/dim]\n")
+                self._log(f"[dim]LLM query generation complete in {time.time() - t0:.1f}s[/dim]\n")
 
         with Progress(
             SpinnerColumn(),
@@ -429,6 +433,11 @@ def main():
         type=Path,
         help="Output directory for reports (default: results/)",
     )
+    parser.add_argument(
+        "--concise",
+        action="store_true",
+        help="Only show final results and query comparison (suppress progress details)",
+    )
 
     # Seed paper options
     parser.add_argument(
@@ -465,7 +474,7 @@ def main():
 
     # Initialize runner
     max_seeds = args.max_seeds if args.max_seeds > 0 else None
-    runner = PipelineRunner(config, max_seeds=max_seeds, rng_seed=args.rng_seed)
+    runner = PipelineRunner(config, max_seeds=max_seeds, rng_seed=args.rng_seed, concise=args.concise)
     console = runner.console
 
     # Handle list command
@@ -495,7 +504,8 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    console.print(f"\n[bold]Running pipeline on {len(studies)} study/studies[/bold]\n")
+    if not args.concise:
+        console.print(f"\n[bold]Running pipeline on {len(studies)} study/studies[/bold]\n")
 
     # Run pipeline
     if len(studies) == 1:

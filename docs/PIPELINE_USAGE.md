@@ -70,6 +70,20 @@ Batch process all studies that have required files:
 uv run python -m src.pipeline.runner --all
 ```
 
+### Compare Your Own Query
+
+Test a custom PubMed query against a study's included papers:
+
+```bash
+# Evaluate your query against study 34
+uv run python compare_query.py 34
+
+# Also show the human strategy side-by-side
+uv run python compare_query.py 34 --show-human
+```
+
+The script prompts you to paste a PubMed query in the terminal (enter a blank line when done), then runs it against PubMed and displays recall, precision, and NNR.
+
 ### Additional Options
 
 | Flag | Description |
