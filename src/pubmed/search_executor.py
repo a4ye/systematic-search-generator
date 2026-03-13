@@ -109,12 +109,17 @@ class PubMedExecutor:
         self.rate_limit_delay = 0.1 if api_key else 0.34
         self.max_retries = 4
 
+    _RETRYABLE_ERRORS = (
+        URLError, RemoteDisconnected, IncompleteRead,
+        TimeoutError, ConnectionError, OSError, RuntimeError,
+    )
+
     def _entrez_call_with_retry(self, fn, **kwargs):
         """Call an Entrez function with retry/backoff for transient failures."""
         for attempt in range(self.max_retries):
             try:
                 return fn(**kwargs)
-            except (URLError, RemoteDisconnected, IncompleteRead, TimeoutError, ConnectionError, OSError) as exc:
+            except self._RETRYABLE_ERRORS as exc:
                 if attempt >= self.max_retries - 1:
                     raise
                 # Exponential backoff capped at 8s
@@ -127,11 +132,20 @@ class PubMedExecutor:
                     raise
                 time.sleep(min(2 ** attempt, 8))
 
+    def _esearch_and_read(self, **kwargs):
+        """Perform esearch and read the result in one retryable unit."""
+        handle = Entrez.esearch(**kwargs)
+        try:
+            results = Entrez.read(handle)
+        finally:
+            handle.close()
+        return results
+
     def count_results(self, query: str) -> int:
         """Get result count without downloading records."""
-        handle = self._entrez_call_with_retry(Entrez.esearch, db="pubmed", term=query, retmax=0)
-        results = Entrez.read(handle)
-        handle.close()
+        results = self._entrez_call_with_retry(
+            self._esearch_and_read, db="pubmed", term=query, retmax=0,
+        )
         return int(results.get("Count", 0))
 
     def execute_query(
@@ -143,15 +157,13 @@ class PubMedExecutor:
         start_time = time.time()
 
         # First, search to get IDs
-        handle = self._entrez_call_with_retry(
-            Entrez.esearch,
+        search_results = self._entrez_call_with_retry(
+            self._esearch_and_read,
             db="pubmed",
             term=query,
             retmax=max_results,
             usehistory="y",
         )
-        search_results = Entrez.read(handle)
-        handle.close()
 
         id_list = search_results.get("IdList", [])
         total_count = int(search_results.get("Count", 0))
@@ -169,22 +181,33 @@ class PubMedExecutor:
         # Fetch records in batches using history
         all_records: list[dict[str, Any]] = []
 
-        for start in range(0, len(id_list), self.batch_size):
-            time.sleep(self.rate_limit_delay)
-
-            handle = self._entrez_call_with_retry(
-                Entrez.efetch,
+        def _fetch_records(start, batch_size, webenv, query_key):
+            """Fetch and parse MEDLINE records in one retryable unit."""
+            handle = Entrez.efetch(
                 db="pubmed",
                 rettype="medline",
                 retmode="text",
                 retstart=start,
-                retmax=self.batch_size,
+                retmax=batch_size,
                 webenv=webenv,
                 query_key=query_key,
             )
+            try:
+                records = list(Medline.parse(handle))
+            finally:
+                handle.close()
+            return records
 
-            records = list(Medline.parse(handle))
-            handle.close()
+        for start in range(0, len(id_list), self.batch_size):
+            time.sleep(self.rate_limit_delay)
+
+            records = self._entrez_call_with_retry(
+                _fetch_records,
+                start=start,
+                batch_size=self.batch_size,
+                webenv=webenv,
+                query_key=query_key,
+            )
             all_records.extend(records)
 
         execution_time = time.time() - start_time
@@ -210,15 +233,13 @@ class PubMedExecutor:
         start_time = time.time()
 
         # First, search to get IDs
-        handle = self._entrez_call_with_retry(
-            Entrez.esearch,
+        search_results = self._entrez_call_with_retry(
+            self._esearch_and_read,
             db="pubmed",
             term=query,
             retmax=max_results,
             usehistory="y",
         )
-        search_results = Entrez.read(handle)
-        handle.close()
 
         id_list = search_results.get("IdList", [])
         total_count = int(search_results.get("Count", 0))
@@ -236,19 +257,31 @@ class PubMedExecutor:
         # Use esummary to get DOIs (much lighter than full MEDLINE)
         pmid_to_doi: dict[str, str] = {}
 
-        for start in range(0, len(id_list), self.batch_size):
-            time.sleep(self.rate_limit_delay)
-
-            handle = self._entrez_call_with_retry(
-                Entrez.esummary,
+        def _fetch_summaries(start, batch_size, webenv, query_key):
+            """Fetch and parse summaries in one retryable unit."""
+            handle = Entrez.esummary(
                 db="pubmed",
                 retstart=start,
-                retmax=self.batch_size,
+                retmax=batch_size,
                 webenv=webenv,
                 query_key=query_key,
             )
-            summaries = Entrez.read(handle)
-            handle.close()
+            try:
+                summaries = Entrez.read(handle)
+            finally:
+                handle.close()
+            return summaries
+
+        for start in range(0, len(id_list), self.batch_size):
+            time.sleep(self.rate_limit_delay)
+
+            summaries = self._entrez_call_with_retry(
+                _fetch_summaries,
+                start=start,
+                batch_size=self.batch_size,
+                webenv=webenv,
+                query_key=query_key,
+            )
 
             # Extract DOIs from summaries
             for summary in summaries:
@@ -317,14 +350,12 @@ class PubMedExecutor:
             validation_query = f"({query}) AND ({pmid_filter})"
 
             try:
-                handle = self._entrez_call_with_retry(
-                    Entrez.esearch,
+                results = self._entrez_call_with_retry(
+                    self._esearch_and_read,
                     db="pubmed",
                     term=validation_query,
                     retmax=len(batch),
                 )
-                results = Entrez.read(handle)
-                handle.close()
 
                 found_ids = results.get("IdList", [])
                 all_found.update(found_ids)

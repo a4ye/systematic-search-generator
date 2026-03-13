@@ -5,16 +5,18 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 
 from src.cache.pubmed_index_cache import PubMedIndexCache
 from src.cache.query_results_cache import QueryResultsCache
 from src.compare_search import extract_included_studies
 from src.discovery.study_finder import StudyFinder
-from src.evaluation.metrics import calculate_metrics_with_pubmed_check
+from src.evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check
 from src.llm.openai_client import OpenAIClient
 from src.pipeline.config import PipelineConfig
 from src.pubmed.search_executor import PubMedExecutor, PubMedSearchResults
@@ -26,7 +28,7 @@ QUERY_PROMPT = """\
 Given a systematic review plan, generate a PubMed Boolean search query optimized for systematic review searching (target roughly <20,000 PubMed results).
 
 Goal:
-Maximize sensitivity while maintaining great precision.
+Maximize sensitivity while maintaining reasonable precision (<50,000 PubMed results).
 
 Instructions:
 
@@ -106,6 +108,23 @@ class StudyResult:
     error: str | None = None
 
 
+def _calculate_total_steps(n_runs: int, include_human: bool) -> int:
+    """Calculate the total number of progress steps for a study pipeline.
+
+    Steps:
+      1. Load included studies
+      2. Extract plan from PDF
+      3. Generate N queries (n_runs steps)
+      4. Fetch PubMed results for N queries (n_runs steps)
+      5. Evaluate LLM metrics
+      6-8. (if human) Extract/load strategy, fetch PubMed, evaluate metrics
+    """
+    total = 2 + n_runs + n_runs + 1  # load + extract + generate + fetch + evaluate
+    if include_human:
+        total += 3  # strategy extract + fetch + evaluate
+    return total
+
+
 def extract_query_from_response(text: str) -> str:
     """Extract the PubMed query from an LLM response.
 
@@ -134,20 +153,36 @@ def extract_query_from_response(text: str) -> str:
     return text.strip()
 
 
-def print_study_table(console: Console, llm_metrics, human_metrics):
-    """Print the per-study comparison table."""
+def print_study_table(
+    console: Console,
+    llm_metrics: EvaluationMetrics,
+    human_metrics: EvaluationMetrics | None,
+    allow_float_counts: bool = False,
+    title: str | None = None,
+):
+    """Print the comparison table."""
     m = llm_metrics
     h = human_metrics
 
-    def fmt_diff_int(gen_val, human_val, higher_is_better=True):
+    count_decimals = 1 if allow_float_counts else 0
+
+    def fmt_count(val: float) -> str:
+        if allow_float_counts:
+            return f"{val:.1f}"
+        return f"{int(val)}"
+
+    def fmt_diff_count(gen_val, human_val, higher_is_better=True):
         if h is None:
             return "[dim]—[/dim]"
         diff = gen_val - human_val
         if human_val != 0:
             pct = (diff / human_val) * 100
-            s = f"{diff:+d} ({pct:+.0f}%)"
+            if allow_float_counts:
+                s = f"{diff:+.{count_decimals}f} ({pct:+.0f}%)"
+            else:
+                s = f"{diff:+d} ({pct:+.0f}%)"
         else:
-            s = f"{diff:+d}"
+            s = f"{diff:+.{count_decimals}f}" if allow_float_counts else f"{diff:+d}"
         if (diff > 0 and higher_is_better) or (diff < 0 and not higher_is_better):
             return f"[green]{s}[/green]"
         elif (diff < 0 and higher_is_better) or (diff > 0 and not higher_is_better):
@@ -184,6 +219,9 @@ def print_study_table(console: Console, llm_metrics, human_metrics):
 
     na = "[dim]—[/dim]"
 
+    if title:
+        console.print(f"[bold]{title}[/bold]")
+
     console.print(f"Included studies:       {m.total_included}")
     console.print(f"Not indexed in PubMed:  {m.not_in_pubmed}")
     console.print(f"PubMed-indexed:         {m.pubmed_indexed_count}")
@@ -197,32 +235,38 @@ def print_study_table(console: Console, llm_metrics, human_metrics):
 
     table.add_row(
         "Search results",
-        str(m.total_results),
-        str(h.total_results) if h else na,
-        fmt_diff_int(m.total_results, h.total_results, higher_is_better=False) if h else na,
+        fmt_count(m.total_results),
+        fmt_count(h.total_results) if h else na,
+        fmt_diff_count(m.total_results, h.total_results, higher_is_better=False) if h else na,
     )
     table.add_row(
         "Captured",
-        f"{m.found} / {m.pubmed_indexed_count}",
-        f"{h.found} / {h.pubmed_indexed_count}" if h else na,
-        fmt_diff_int(m.found, h.found) if h else na,
+        f"{fmt_count(m.found)} / {fmt_count(m.pubmed_indexed_count)}",
+        f"{fmt_count(h.found)} / {fmt_count(h.pubmed_indexed_count)}" if h else na,
+        fmt_diff_count(m.found, h.found) if h else na,
     )
     table.add_row(
         "Missed (in PubMed)",
-        str(m.missed_pubmed_indexed),
-        str(h.missed_pubmed_indexed) if h else na,
-        fmt_diff_int(m.missed_pubmed_indexed, h.missed_pubmed_indexed, higher_is_better=False) if h else na,
+        fmt_count(m.missed_pubmed_indexed),
+        fmt_count(h.missed_pubmed_indexed) if h else na,
+        fmt_diff_count(
+            m.missed_pubmed_indexed,
+            h.missed_pubmed_indexed,
+            higher_is_better=False,
+        )
+        if h
+        else na,
     )
     table.add_row(
         "Recall (overall)",
-        f"{m.recall_overall * 100:.1f}%  ({m.found}/{m.total_included})",
-        f"{h.recall_overall * 100:.1f}%  ({h.found}/{h.total_included})" if h else na,
+        f"{m.recall_overall * 100:.1f}%  ({fmt_count(m.found)}/{fmt_count(m.total_included)})",
+        f"{h.recall_overall * 100:.1f}%  ({fmt_count(h.found)}/{fmt_count(h.total_included)})" if h else na,
         fmt_diff_pct(m.recall_overall, h.recall_overall) if h else na,
     )
     table.add_row(
         "Recall (PubMed only)",
-        f"{m.recall_pubmed_only * 100:.1f}%  ({m.found}/{m.pubmed_indexed_count})",
-        f"{h.recall_pubmed_only * 100:.1f}%  ({h.found}/{h.pubmed_indexed_count})" if h else na,
+        f"{m.recall_pubmed_only * 100:.1f}%  ({fmt_count(m.found)}/{fmt_count(m.pubmed_indexed_count)})",
+        f"{h.recall_pubmed_only * 100:.1f}%  ({fmt_count(h.found)}/{fmt_count(h.pubmed_indexed_count)})" if h else na,
         fmt_diff_pct(m.recall_pubmed_only, h.recall_pubmed_only) if h else na,
     )
 
@@ -234,8 +278,8 @@ def print_study_table(console: Console, llm_metrics, human_metrics):
 
     table.add_row(
         "Precision",
-        f"{m.precision * 100:.2f}%  ({m.found}/{m.total_results})",
-        f"{h.precision * 100:.2f}%  ({h.found}/{h.total_results})" if h else na,
+        f"{m.precision * 100:.2f}%  ({fmt_count(m.found)}/{fmt_count(m.total_results)})",
+        f"{h.precision * 100:.2f}%  ({fmt_count(h.found)}/{fmt_count(h.total_results)})" if h else na,
         precision_diff,
     )
     table.add_row(
@@ -247,6 +291,90 @@ def print_study_table(console: Console, llm_metrics, human_metrics):
 
     console.print(table)
     console.print()
+
+
+def aggregate_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
+    """Aggregate metrics across multiple studies."""
+    total_results = sum(m.total_results for m in metrics_list)
+    total_included = sum(m.total_included for m in metrics_list)
+    found = sum(m.found for m in metrics_list)
+    not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list)
+    missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list)
+    missed = total_included - found
+    pubmed_indexed = total_included - not_in_pubmed
+
+    recall_overall = found / total_included if total_included > 0 else 0.0
+    recall_pubmed = found / pubmed_indexed if pubmed_indexed > 0 else 0.0
+    precision = found / total_results if total_results > 0 else 0.0
+    nnr = total_results / found if found > 0 else float("inf")
+    if precision + recall_overall > 0:
+        f1 = 2 * (precision * recall_overall) / (precision + recall_overall)
+    else:
+        f1 = 0.0
+
+    return EvaluationMetrics(
+        total_results=total_results,
+        total_included=total_included,
+        found=found,
+        missed=missed,
+        not_in_pubmed=not_in_pubmed,
+        missed_pubmed_indexed=missed_pubmed_indexed,
+        recall_overall=recall_overall,
+        recall_pubmed_only=recall_pubmed,
+        precision=precision,
+        nnr=nnr,
+        f1_score=f1,
+    )
+
+
+def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
+    """Compute simple mean of per-study metrics."""
+    n = len(metrics_list)
+    if n == 0:
+        return EvaluationMetrics(
+            total_results=0,
+            total_included=0,
+            found=0,
+            missed=0,
+            not_in_pubmed=0,
+            missed_pubmed_indexed=0,
+            recall_overall=0.0,
+            recall_pubmed_only=0.0,
+            precision=0.0,
+            nnr=float("inf"),
+            f1_score=0.0,
+        )
+
+    total_results = sum(m.total_results for m in metrics_list) / n
+    total_included = sum(m.total_included for m in metrics_list) / n
+    found = sum(m.found for m in metrics_list) / n
+    not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list) / n
+    missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list) / n
+    missed = total_included - found
+
+    recall_overall = sum(m.recall_overall for m in metrics_list) / n
+    recall_pubmed = sum(m.recall_pubmed_only for m in metrics_list) / n
+    precision = sum(m.precision for m in metrics_list) / n
+
+    finite_nnrs = [m.nnr for m in metrics_list if m.nnr != float("inf")]
+    nnr = sum(finite_nnrs) / len(finite_nnrs) if finite_nnrs else float("inf")
+
+    finite_f1 = [m.f1_score for m in metrics_list]
+    f1 = sum(finite_f1) / n
+
+    return EvaluationMetrics(
+        total_results=total_results,
+        total_included=total_included,
+        found=found,
+        missed=missed,
+        not_in_pubmed=not_in_pubmed,
+        missed_pubmed_indexed=missed_pubmed_indexed,
+        recall_overall=recall_overall,
+        recall_pubmed_only=recall_pubmed,
+        precision=precision,
+        nnr=nnr,
+        f1_score=f1,
+    )
 
 
 def run_study(
@@ -274,12 +402,14 @@ def run_study(
 
     console.print(f"\n[bold]Study: {study.study_id} - {study.name}[/bold]")
 
-    # Extract-only mode
+    # Extract-only mode (no progress bar needed)
     if args.extract:
         console.print(f"\n[dim]Extracting plan with {MODEL}...[/dim]")
         response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
         console.print(
-            f"[dim]Tokens: {response.prompt_tokens} in / {response.completion_tokens} out, {response.generation_time:.1f}s[/dim]\n")
+            f"[dim]Tokens: {response.prompt_tokens} in / {response.completion_tokens} out, "
+            f"{response.generation_time:.1f}s[/dim]\n"
+        )
         console.print(response.content, markup=False, highlight=False)
         return None
 
@@ -287,147 +417,179 @@ def run_study(
         console.print(f"[red]Study {study_id_arg} has no included studies file[/red]")
         return None
 
-    # Load included studies
-    included_result = extract_included_studies(str(study.included_studies_xlsx))
-    if not included_result.is_valid:
-        console.print(f"[red]Error loading included studies: {included_result.error}[/red]")
-        return None
-
-    included_studies = included_result.studies
-    console.print(f"Included studies: {len(included_studies)}")
-
-    # Step 1: Extract plan from PROSPERO PDF
-    console.print(f"\n[dim]Step 1: Extracting plan with {MODEL}...[/dim]")
-    extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
-    plan_info = extract_response.content
-    console.print(
-        f"[dim]  Tokens: {extract_response.prompt_tokens} in / {extract_response.completion_tokens} out, {extract_response.generation_time:.1f}s[/dim]")
-
-    # Step 2: Generate query from extracted plan
     n_runs = args.n
-    console.print(f"\n[dim]Step 2: Generating query with {MODEL} (n={n_runs})...[/dim]")
-    query_prompt = QUERY_PROMPT + "\n" + plan_info
-    if args.double_prompt:
-        query_prompt = query_prompt + "\n\n---\n\n" + query_prompt
-        console.print("[dim]  (prompt doubled)[/dim]")
+    include_human = not args.no_human and study.search_strategy_docx is not None
+    total_steps = _calculate_total_steps(n_runs, include_human)
 
-    # Save the final composed prompt
-    prompt_dir = Path("temp")
-    prompt_dir.mkdir(exist_ok=True)
-    (prompt_dir / "final-prompt.txt").write_text(query_prompt)
-    console.print(f"[dim]  Saved final prompt to temp/final-prompt.txt[/dim]")
-
-    def _generate_one(run_i: int) -> tuple[int, str, int, int, float]:
-        """Generate a single query. Returns (index, query, prompt_tokens, completion_tokens, time)."""
-        resp = client.generate_text(prompt=query_prompt)
-        q = extract_query_from_response(resp.content)
-        return run_i, q, resp.prompt_tokens, resp.completion_tokens, resp.generation_time
-
-    if n_runs == 1:
-        _, q, pt, ct, gt = _generate_one(0)
-        generated_queries = [q]
-        console.print(f"[dim]  Tokens: {pt} in / {ct} out, {gt:.1f}s[/dim]")
-    else:
-        console.print(f"[dim]  Launching {n_runs} LLM calls in parallel...[/dim]")
-        generated_queries = [""] * n_runs
-        with ThreadPoolExecutor(max_workers=n_runs) as executor:
-            futures = {executor.submit(_generate_one, i): i for i in range(n_runs)}
-            for future in as_completed(futures):
-                run_i, q, pt, ct, gt = future.result()
-                generated_queries[run_i] = q
-                console.print(f"[dim]  Run {run_i + 1}/{n_runs} done — {pt} in / {ct} out, {gt:.1f}s[/dim]")
-
-    def fetch_or_cached(query: str) -> PubMedSearchResults:
-        cached_result = query_cache.get(query)
-        if cached_result:
-            console.print("[dim]Using cached PubMed results[/dim]")
-            return PubMedSearchResults.from_cached(
-                query=query,
-                pmids=cached_result.pmids,
-                result_count=cached_result.result_count,
-                doi_to_pmid=cached_result.doi_to_pmid,
-            )
-
-        console.print("[dim]Counting results...[/dim]")
-        result_count = pubmed.count_results(query)
-        if result_count > 50000:
-            console.print(f"[red]Query too broad: {result_count:,} results (max 50,000)[/red]")
-            return None
-
-        console.print(f"[dim]Fetching {result_count:,} results...[/dim]")
-        search_results = pubmed.execute_query_fast(query, max_results=config.max_pubmed_results)
-
-        pmids = list(search_results.pmid_map.keys())
-        doi_to_pmid = {doi: info["pmid"] for doi, info in search_results.doi_map.items()}
-        query_cache.set(query, pmids, search_results.result_count, doi_to_pmid)
-
-        return search_results
-
-    # Execute each generated query and merge results (union of PMIDs)
-    all_results: list[PubMedSearchResults] = []
-    seen_queries: dict[str, PubMedSearchResults] = {}
-    for i, q in enumerate(generated_queries):
-        if n_runs > 1:
-            console.print(f"\n[dim]Fetching results for query {i + 1}/{n_runs}...[/dim]")
-            console.print(f"[dim]  {q[:100]}{'...' if len(q) > 100 else ''}[/dim]")
-        if q in seen_queries:
-            console.print("[dim]  Duplicate query, reusing results[/dim]")
-            all_results.append(seen_queries[q])
-        else:
-            result = fetch_or_cached(q)
-            if result is None:
-                console.print(f"[red]Skipping query {i + 1} (too broad)[/red]")
-                continue
-            seen_queries[q] = result
-            all_results.append(result)
-
-    if not all_results:
-        console.print("[red]No valid query results[/red]")
-        return None
-
-    if n_runs == 1 or len(all_results) == 1:
-        llm_results = all_results[0]
-    else:
-        # Merge: union of PMIDs and DOIs across all runs
-        merged_pmid_map: dict[str, dict] = {}
-        merged_doi_map: dict[str, dict] = {}
-        for result in all_results:
-            for pmid, info in result.pmid_map.items():
-                if pmid not in merged_pmid_map:
-                    merged_pmid_map[pmid] = info
-            for doi, info in result.doi_map.items():
-                if doi not in merged_doi_map:
-                    merged_doi_map[doi] = info
-
-        merged_pmids = list(merged_pmid_map.keys())
-        merged_doi_to_pmid = {doi: info["pmid"] for doi, info in merged_doi_map.items()}
-
-        llm_results = PubMedSearchResults.from_cached(
-            query=f"MERGED({n_runs} runs)",
-            pmids=merged_pmids,
-            result_count=len(merged_pmids),
-            doi_to_pmid=merged_doi_to_pmid,
-        )
-
-        per_query_counts = [r.result_count for r in all_results]
-        console.print(f"\n[dim]Per-query result counts: {per_query_counts}[/dim]")
-        console.print(f"[dim]Merged unique PMIDs: {len(merged_pmids):,}[/dim]")
-
-    console.print("[dim]Checking PubMed indexing...[/dim]")
-    llm_metrics = calculate_metrics_with_pubmed_check(
-        llm_results,
-        included_studies,
-        entrez_email=config.entrez_email,
-        rate_delay=rate_delay,
-        index_cache=index_cache,
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
     )
 
-    # Evaluate human strategy (default, skip with --no-human)
-    human_metrics = None
-    if not args.no_human:
-        if not study.search_strategy_docx:
-            console.print("[yellow]No human search strategy available for this study[/yellow]")
+    with progress:
+        task_id = progress.add_task("Loading included studies...", total=total_steps)
+        log = progress.console
+
+        def step(description: str) -> None:
+            progress.update(task_id, description=description, advance=1)
+
+        # Load included studies
+        included_result = extract_included_studies(str(study.included_studies_xlsx))
+        step("Loading included studies")
+        if not included_result.is_valid:
+            log.print(f"[red]Error loading included studies: {included_result.error}[/red]")
+            return None
+
+        included_studies = included_result.studies
+        log.print(f"Included studies: {len(included_studies)}")
+
+        # Step 1: Extract plan from PROSPERO PDF
+        progress.update(task_id, description=f"Extracting plan with {MODEL}...")
+        extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
+        step("Extracted plan")
+        plan_info = extract_response.content
+        log.print(
+            f"[dim]  Tokens: {extract_response.prompt_tokens} in / {extract_response.completion_tokens} out, "
+            f"{extract_response.generation_time:.1f}s[/dim]"
+        )
+
+        # Step 2: Generate query from extracted plan
+        query_prompt = QUERY_PROMPT + "\n" + plan_info
+        if args.double_prompt:
+            query_prompt = query_prompt + "\n\n---\n\n" + query_prompt
+            log.print("[dim]  (prompt doubled)[/dim]")
+
+        # Save the final composed prompt
+        prompt_dir = Path("temp")
+        prompt_dir.mkdir(exist_ok=True)
+        (prompt_dir / "final-prompt.txt").write_text(query_prompt)
+
+        def _generate_one(run_i: int) -> tuple[int, str, int, int, float]:
+            resp = client.generate_text(prompt=query_prompt)
+            q = extract_query_from_response(resp.content)
+            return run_i, q, resp.prompt_tokens, resp.completion_tokens, resp.generation_time
+
+        if n_runs == 1:
+            progress.update(task_id, description="Generating query...")
+            _, q, pt, ct, gt = _generate_one(0)
+            step("Generated query")
+            generated_queries = [q]
+            log.print(f"[dim]  Tokens: {pt} in / {ct} out, {gt:.1f}s[/dim]")
         else:
+            log.print(f"[dim]  Launching {n_runs} LLM calls in parallel...[/dim]")
+            generated_queries = [""] * n_runs
+            completed_runs = 0
+            with ThreadPoolExecutor(max_workers=n_runs) as executor:
+                futures = {executor.submit(_generate_one, i): i for i in range(n_runs)}
+                for future in as_completed(futures):
+                    run_i, q, pt, ct, gt = future.result()
+                    generated_queries[run_i] = q
+                    completed_runs += 1
+                    step(f"Generated query {completed_runs}/{n_runs}")
+                    log.print(
+                        f"[dim]  Run {run_i + 1}/{n_runs} done — {pt} in / {ct} out, {gt:.1f}s[/dim]"
+                    )
+
+        def fetch_or_cached(query: str, label: str) -> PubMedSearchResults | None:
+            cached_result = query_cache.get(query)
+            if cached_result:
+                log.print(f"[dim]{label}: using cached PubMed results[/dim]")
+                step(f"{label}: cached")
+                return PubMedSearchResults.from_cached(
+                    query=query,
+                    pmids=cached_result.pmids,
+                    result_count=cached_result.result_count,
+                    doi_to_pmid=cached_result.doi_to_pmid,
+                )
+
+            progress.update(task_id, description=f"{label}: counting results...")
+            result_count = pubmed.count_results(query)
+            if result_count > 50000:
+                log.print(f"[red]Query too broad: {result_count:,} results (max 50,000)[/red]")
+                step(f"{label}: too broad")
+                return None
+
+            progress.update(task_id, description=f"{label}: fetching {result_count:,} results...")
+            search_results = pubmed.execute_query_fast(query, max_results=config.max_pubmed_results)
+            step(f"{label}: fetched {result_count:,}")
+
+            pmids = list(search_results.pmid_map.keys())
+            doi_to_pmid = {doi: info["pmid"] for doi, info in search_results.doi_map.items()}
+            query_cache.set(query, pmids, search_results.result_count, doi_to_pmid)
+
+            return search_results
+
+        # Execute each generated query and merge results (union of PMIDs)
+        all_results: list[PubMedSearchResults] = []
+        seen_queries: dict[str, PubMedSearchResults] = {}
+        for i, q in enumerate(generated_queries):
+            label = f"Query {i + 1}/{n_runs}"
+            if n_runs > 1:
+                log.print(f"\n[dim]Fetching results for query {i + 1}/{n_runs}...[/dim]")
+                log.print(f"[dim]  {q[:100]}{'...' if len(q) > 100 else ''}[/dim]")
+            if q in seen_queries:
+                log.print("[dim]  Duplicate query, reusing results[/dim]")
+                step(f"{label}: duplicate")
+                all_results.append(seen_queries[q])
+            else:
+                result = fetch_or_cached(q, label)
+                if result is None:
+                    log.print(f"[red]Skipping query {i + 1} (too broad)[/red]")
+                    continue
+                seen_queries[q] = result
+                all_results.append(result)
+
+        if not all_results:
+            log.print("[red]No valid query results[/red]")
+            return None
+
+        if n_runs == 1 or len(all_results) == 1:
+            llm_results = all_results[0]
+        else:
+            # Merge: union of PMIDs and DOIs across all runs
+            merged_pmid_map: dict[str, dict] = {}
+            merged_doi_map: dict[str, dict] = {}
+            for result in all_results:
+                for pmid, info in result.pmid_map.items():
+                    if pmid not in merged_pmid_map:
+                        merged_pmid_map[pmid] = info
+                for doi, info in result.doi_map.items():
+                    if doi not in merged_doi_map:
+                        merged_doi_map[doi] = info
+
+            merged_pmids = list(merged_pmid_map.keys())
+            merged_doi_to_pmid = {doi: info["pmid"] for doi, info in merged_doi_map.items()}
+
+            llm_results = PubMedSearchResults.from_cached(
+                query=f"MERGED({n_runs} runs)",
+                pmids=merged_pmids,
+                result_count=len(merged_pmids),
+                doi_to_pmid=merged_doi_to_pmid,
+            )
+
+            per_query_counts = [r.result_count for r in all_results]
+            log.print(f"\n[dim]Per-query result counts: {per_query_counts}[/dim]")
+            log.print(f"[dim]Merged unique PMIDs: {len(merged_pmids):,}[/dim]")
+
+        progress.update(task_id, description="Checking PubMed indexing (LLM)...")
+        llm_metrics = calculate_metrics_with_pubmed_check(
+            llm_results,
+            included_studies,
+            entrez_email=config.entrez_email,
+            rate_delay=rate_delay,
+            index_cache=index_cache,
+        )
+        step("Checked PubMed indexing (LLM)")
+
+        # Evaluate human strategy (default, skip with --no-human)
+        human_metrics = None
+        if include_human:
             from src.cache.strategy_cache import StrategyCache
 
             strategy_cache = StrategyCache(config.cache_dir)
@@ -435,20 +597,23 @@ def run_study(
 
             human_query = None
             if cached:
-                console.print("[dim]Using cached human strategy[/dim]")
+                log.print("[dim]Using cached human strategy[/dim]")
                 human_query = cached.query
+                step("Human strategy: cached")
             else:
                 from src.llm.strategy_extractor import StrategyExtractor
 
                 extractor = StrategyExtractor(client, strategy_cache)
-                console.print("[dim]Extracting human strategy...[/dim]")
+                progress.update(task_id, description="Extracting human strategy...")
                 extracted = extractor.extract_strategy(study.search_strategy_docx)
+                step("Extracted human strategy")
                 if extracted.query:
                     human_query = extracted.query
 
             if human_query:
-                human_results = fetch_or_cached(human_query)
+                human_results = fetch_or_cached(human_query, "Human query")
                 if human_results:
+                    progress.update(task_id, description="Checking PubMed indexing (human)...")
                     human_metrics = calculate_metrics_with_pubmed_check(
                         human_results,
                         included_studies,
@@ -456,10 +621,18 @@ def run_study(
                         rate_delay=rate_delay,
                         index_cache=index_cache,
                     )
+                    step("Checked PubMed indexing (human)")
+                else:
+                    # Advance remaining human steps so bar completes
+                    progress.advance(task_id, 2)
             else:
-                console.print("[yellow]Failed to extract human strategy[/yellow]")
+                log.print("[yellow]Failed to extract human strategy[/yellow]")
+                # Advance remaining human steps so bar completes
+                progress.advance(task_id, 2)
+        elif not args.no_human and not study.search_strategy_docx:
+            log.print("[yellow]No human search strategy available for this study[/yellow]")
 
-    # Print per-study results
+    # Print per-study results (outside progress context so bar is cleared)
     console.print()
     console.print("─" * 70)
     print_study_table(console, llm_metrics, human_metrics)
@@ -470,6 +643,109 @@ def run_study(
         llm_metrics=llm_metrics,
         human_metrics=human_metrics,
     )
+
+
+def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Path:
+    """Save results to a markdown file in results/."""
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    study_ids = "_".join(r.study_id for r in results)
+    filename = f"results_{study_ids}_{timestamp}.md"
+    filepath = results_dir / filename
+
+    lines: list[str] = []
+    lines.append(f"# Query Generation Results")
+    lines.append(f"")
+    lines.append(f"- **Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- **Model**: {MODEL}")
+    lines.append(f"- **N runs**: {args.n}")
+    lines.append(f"- **Double prompt**: {args.double_prompt}")
+    lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
+    lines.append(f"")
+
+    for r in results:
+        m = r.llm_metrics
+        h = r.human_metrics
+
+        lines.append(f"## Study {r.study_id} - {r.study_name}")
+        lines.append(f"")
+        lines.append(f"| Metric | Generated | Human |")
+        lines.append(f"|--------|-----------|-------|")
+        lines.append(f"| Search results | {m.total_results} | {h.total_results if h else '—'} |")
+        lines.append(f"| Included studies | {m.total_included} | {h.total_included if h else '—'} |")
+        lines.append(f"| Not in PubMed | {m.not_in_pubmed} | {h.not_in_pubmed if h else '—'} |")
+        lines.append(f"| PubMed-indexed | {m.pubmed_indexed_count} | {h.pubmed_indexed_count if h else '—'} |")
+        lines.append(f"| Captured | {m.found}/{m.pubmed_indexed_count} | {h.found}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found}/{m.pubmed_indexed_count} | — |")
+        lines.append(f"| Missed (in PubMed) | {m.missed_pubmed_indexed} | {h.missed_pubmed_indexed if h else '—'} |")
+        lines.append(f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | {h.recall_overall * 100:.1f}% ({h.found}/{h.total_included}) |" if h else f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | — |")
+        lines.append(f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | — |")
+        lines.append(f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | {h.precision * 100:.2f}% ({h.found}/{h.total_results}) |" if h else f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | — |")
+        nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
+        h_nnr_str = f"{h.nnr:.1f}" if h and h.nnr != float("inf") else "—"
+        lines.append(f"| NNR | {nnr_str} | {h_nnr_str} |")
+        lines.append(f"")
+
+    # Summary table if multiple studies
+    if len(results) > 1:
+        lines.append(f"## Summary")
+        lines.append(f"")
+        lines.append(
+            "| Study | Results | Recall | Recall (PM) | Precision | NNR | H-Recall | H-Results | H-Precision |"
+        )
+        lines.append(
+            "|-------|---------|--------|-------------|-----------|-----|----------|-----------|-------------|"
+        )
+
+        for r in results:
+            m = r.llm_metrics
+            h = r.human_metrics
+            label = f"{r.study_id} - {r.study_name}"
+            recall_str = f"{m.recall_overall * 100:.1f}% ({m.found}/{m.total_included})"
+            recall_pm_str = f"{m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count})"
+            precision_str = f"{m.precision * 100:.2f}%"
+            nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
+            h_recall_str = f"{h.recall_overall * 100:.1f}% ({h.found}/{h.total_included})" if h else "—"
+            h_results_str = str(h.total_results) if h else "—"
+            h_precision_str = f"{h.precision * 100:.2f}%" if h else "—"
+            lines.append(
+                f"| {label} | {m.total_results} | {recall_str} | {recall_pm_str} | {precision_str} | {nnr_str} "
+                f"| {h_recall_str} | {h_results_str} | {h_precision_str} |"
+            )
+
+        # Averages
+        n = len(results)
+        avg_recall = sum(r.llm_metrics.recall_overall for r in results) / n * 100
+        avg_recall_pm = sum(r.llm_metrics.recall_pubmed_only for r in results) / n * 100
+        avg_precision = sum(r.llm_metrics.precision for r in results) / n * 100
+        finite_nnrs = [r.llm_metrics.nnr for r in results if r.llm_metrics.nnr != float("inf")]
+        avg_nnr = sum(finite_nnrs) / len(finite_nnrs) if finite_nnrs else float("inf")
+        avg_nnr_str = f"{avg_nnr:.1f}" if avg_nnr != float("inf") else "—"
+        avg_results = sum(r.llm_metrics.total_results for r in results) // n
+
+        human_with = [r for r in results if r.human_metrics is not None]
+        if human_with:
+            h_n = len(human_with)
+            h_avg_recall = sum(r.human_metrics.recall_overall for r in human_with) / h_n * 100
+            h_avg_recall_str = f"{h_avg_recall:.1f}%"
+            h_avg_results_str = str(sum(r.human_metrics.total_results for r in human_with) // h_n)
+            h_avg_precision = sum(r.human_metrics.precision for r in human_with) / h_n * 100
+            h_avg_precision_str = f"{h_avg_precision:.2f}%"
+        else:
+            h_avg_recall_str = "—"
+            h_avg_results_str = "—"
+            h_avg_precision_str = "—"
+
+        lines.append(
+            f"| **AVG** | **{avg_results}** | **{avg_recall:.1f}%** | **{avg_recall_pm:.1f}%** "
+            f"| **{avg_precision:.2f}%** | **{avg_nnr_str}** | **{h_avg_recall_str}** "
+            f"| **{h_avg_results_str}** | **{h_avg_precision_str}** |"
+        )
+        lines.append(f"")
+
+    filepath.write_text("\n".join(lines))
+    return filepath
 
 
 def main():
@@ -538,103 +814,40 @@ def main():
         console.print("[bold]Summary across all studies[/bold]")
         console.print()
 
-        na = "[dim]—[/dim]"
+        llm_summary = aggregate_metrics([r.llm_metrics for r in results])
+        llm_mean = mean_metrics([r.llm_metrics for r in results])
 
-        summary = Table(show_header=True, header_style="bold")
-        summary.add_column("Study", width=30)
-        summary.add_column("Results", justify="right", width=10)
-        summary.add_column("Recall", justify="right", width=14)
-        summary.add_column("Recall (PM)", justify="right", width=14)
-        summary.add_column("Precision", justify="right", width=12)
-        summary.add_column("NNR", justify="right", width=8)
-        summary.add_column("H-Recall", justify="right", width=14)
-        summary.add_column("H-Results", justify="right", width=10)
-
-        total_found = 0
-        total_included = 0
-        total_pm_indexed = 0
-        total_results = 0
-        h_total_found = 0
-        h_total_included = 0
-        h_total_results = 0
-        has_any_human = False
-
-        for r in results:
-            m = r.llm_metrics
-            h = r.human_metrics
-
-            label = f"{r.study_id} - {r.study_name}"
-            if len(label) > 30:
-                label = label[:27] + "..."
-
-            recall_str = f"{m.recall_overall * 100:.1f}% ({m.found}/{m.total_included})"
-            recall_pm_str = f"{m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count})"
-            precision_str = f"{m.precision * 100:.2f}%"
-            nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
-
-            if h:
-                has_any_human = True
-                h_recall_str = f"{h.recall_overall * 100:.1f}% ({h.found}/{h.total_included})"
-                h_results_str = str(h.total_results)
-                h_total_found += h.found
-                h_total_included += h.total_included
-                h_total_results += h.total_results
-            else:
-                h_recall_str = na
-                h_results_str = na
-
-            total_found += m.found
-            total_included += m.total_included
-            total_pm_indexed += m.pubmed_indexed_count
-            total_results += m.total_results
-
-            summary.add_row(
-                label,
-                str(m.total_results),
-                recall_str,
-                recall_pm_str,
-                precision_str,
-                nnr_str,
-                h_recall_str,
-                h_results_str,
+        human_metrics_list = [r.human_metrics for r in results if r.human_metrics is not None]
+        human_summary = None
+        human_mean = None
+        if len(human_metrics_list) == len(results):
+            human_summary = aggregate_metrics(human_metrics_list)
+            human_mean = mean_metrics(human_metrics_list)
+        elif human_metrics_list:
+            console.print(
+                f"[dim]Human summary omitted: only {len(human_metrics_list)}/{len(results)} "
+                f"studies have human strategies.[/dim]"
             )
 
-        # Averages row
-        if total_included > 0:
-            avg_recall = total_found / total_included * 100
-        else:
-            avg_recall = 0.0
-        if total_pm_indexed > 0:
-            avg_recall_pm = total_found / total_pm_indexed * 100
-        else:
-            avg_recall_pm = 0.0
-        if total_results > 0:
-            avg_precision = total_found / total_results * 100
-            avg_nnr = total_results / total_found if total_found > 0 else float("inf")
-        else:
-            avg_precision = 0.0
-            avg_nnr = float("inf")
-
-        h_avg_recall_str = na
-        h_avg_results_str = na
-        if has_any_human and h_total_included > 0:
-            h_avg_recall_str = f"{h_total_found / h_total_included * 100:.1f}% ({h_total_found}/{h_total_included})"
-            h_avg_results_str = str(h_total_results)
-
-        summary.add_section()
-        summary.add_row(
-            "[bold]TOTAL[/bold]",
-            f"[bold]{total_results}[/bold]",
-            f"[bold]{avg_recall:.1f}% ({total_found}/{total_included})[/bold]",
-            f"[bold]{avg_recall_pm:.1f}% ({total_found}/{total_pm_indexed})[/bold]",
-            f"[bold]{avg_precision:.2f}%[/bold]",
-            f"[bold]{avg_nnr:.1f}[/bold]" if avg_nnr != float("inf") else "[bold]—[/bold]",
-            f"[bold]{h_avg_recall_str}[/bold]" if has_any_human else na,
-            f"[bold]{h_avg_results_str}[/bold]" if has_any_human else na,
+        print_study_table(
+            console,
+            llm_summary,
+            human_summary,
+            title="Pooled totals (weighted)",
+        )
+        console.print()
+        print_study_table(
+            console,
+            llm_mean,
+            human_mean,
+            allow_float_counts=True,
+            title="Simple mean across studies",
         )
 
-        console.print(summary)
-        console.print()
+    # Save results to markdown
+    if results:
+        md_path = save_results_md(results, args)
+        console.print(f"[dim]Results saved to {md_path}[/dim]")
 
 
 if __name__ == "__main__":

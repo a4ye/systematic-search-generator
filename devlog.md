@@ -424,6 +424,7 @@ more ideas:
 - using hedges (medical libarians use them)
 
 - new idea: multiple narrow queries and then merge the results, instead of one broad query, which might improve precision while maintaining recall
+- prune n queries with the longest and/or shortest results to find a better balance between recall and precision
 
 
 ## Next Steps
