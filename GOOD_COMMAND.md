@@ -1,0 +1,1 @@
+` uv run python generate_query.py 34 -n 5 --seeds 5 --save-prompt --seed-fields tm --show-missed --citations --citation-depth 1 --two-pass --similar 100 --two-pass-max 5`

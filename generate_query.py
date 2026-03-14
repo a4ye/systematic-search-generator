@@ -19,7 +19,7 @@ from Bio import Entrez, Medline
 
 from src.cache.pubmed_index_cache import PubMedIndexCache
 from src.cache.query_results_cache import QueryResultsCache
-from src.compare_search import extract_included_studies
+from src.compare_search import IncludedStudy, extract_included_studies
 from src.discovery.study_finder import StudyFinder
 from src.evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check, match_studies
 from src.llm.openai_client import OpenAIClient
@@ -249,6 +249,98 @@ def fetch_dois_for_pmids(
     return pmid_to_dois
 
 
+def fetch_similar_pmids(
+    seed_pmids: list[str],
+    email: str,
+    api_key: str | None,
+    rate_delay: float,
+    per_seed: int,
+) -> dict[str, list[str]]:
+    """Fetch similar articles from PubMed for each seed PMID."""
+    if not seed_pmids or per_seed <= 0:
+        return {}
+
+    Entrez.email = email
+    if api_key:
+        Entrez.api_key = api_key
+
+    results: dict[str, list[str]] = {}
+    for pmid in seed_pmids:
+        time.sleep(rate_delay)
+        handle = Entrez.elink(
+            dbfrom="pubmed",
+            db="pubmed",
+            id=pmid,
+            linkname="pubmed_pubmed",
+            retmax=per_seed,
+        )
+        try:
+            record = Entrez.read(handle)
+        finally:
+            handle.close()
+
+        pmids: list[str] = []
+        try:
+            linksets = record or []
+            for linkset in linksets:
+                for db in linkset.get("LinkSetDb", []):
+                    for link in db.get("Link", []):
+                        pid = link.get("Id")
+                        if pid:
+                            pmids.append(str(pid))
+        except Exception:
+            pmids = []
+
+        if pmids:
+            results[pmid] = pmids[:per_seed]
+
+    return results
+
+
+def count_found_studies(
+    search_results: PubMedSearchResults,
+    included_studies: list[IncludedStudy],
+) -> int:
+    """Count how many included studies match the search results."""
+    found = 0
+    for study in included_studies:
+        match = None
+        if study.doi:
+            match = search_results.match_by_doi(study.doi)
+        if not match and study.pmid:
+            match = search_results.match_by_pmid(study.pmid)
+        if match:
+            found += 1
+    return found
+
+
+def get_missed_seed_papers(
+    seed_papers: list[dict],
+    search_results: PubMedSearchResults,
+) -> tuple[list[dict], int]:
+    """Return seed papers missed by the search results and count unchecked seeds."""
+    missed: list[dict] = []
+    unchecked = 0
+    for sp in seed_papers:
+        pmid = sp.get("pmid")
+        doi = sp.get("doi")
+        if not pmid and not doi:
+            unchecked += 1
+            continue
+        matched = False
+        if doi:
+            doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
+            if search_results.match_by_doi(doi_norm):
+                matched = True
+        if not matched and pmid:
+            pmid_str = str(pmid).strip()
+            if search_results.match_by_pmid(pmid_str):
+                matched = True
+        if not matched:
+            missed.append(sp)
+    return missed, unchecked
+
+
 # ── End configuration ────────────────────────────────────────────────────────
 
 
@@ -268,10 +360,17 @@ class StudyResult:
     citation_stats: dict | None = None  # {total, new, hits}
     supplement_query: str | None = None
     supplement_stats: dict | None = None
+    similar_stats: dict | None = None
     error: str | None = None
 
 
-def _calculate_total_steps(n_runs: int, include_human: bool, two_pass: bool) -> int:
+def _calculate_total_steps(
+    n_runs: int,
+    include_human: bool,
+    two_pass: bool,
+    similar: bool,
+    two_pass_max: int,
+) -> int:
     """Calculate the total number of progress steps for a study pipeline.
 
     Steps:
@@ -284,7 +383,9 @@ def _calculate_total_steps(n_runs: int, include_human: bool, two_pass: bool) -> 
     """
     total = 2 + n_runs + 1 + 1  # load + extract + generate(n) + fetch(1) + evaluate
     if two_pass:
-        total += 2  # supplement LLM + supplement fetch
+        total += 2 * max(1, two_pass_max)  # supplement LLM + supplement fetch (max passes)
+    if similar:
+        total += 1  # similar articles fetch
     if include_human:
         total += 3  # strategy extract + fetch + evaluate
     return total
@@ -584,7 +685,13 @@ def run_study(
 
     n_runs = args.n
     include_human = not args.no_human and study.search_strategy_docx is not None
-    total_steps = _calculate_total_steps(n_runs, include_human, args.two_pass)
+    total_steps = _calculate_total_steps(
+        n_runs,
+        include_human,
+        args.two_pass,
+        args.similar > 0,
+        args.two_pass_max,
+    )
 
     progress = Progress(
         SpinnerColumn(),
@@ -725,33 +832,27 @@ def run_study(
         if args.two_pass:
             if not seed_papers:
                 log.print("[yellow]Two-pass enabled but no seed papers available; skipping[/yellow]")
-                progress.advance(task_id, 2)
+                progress.advance(task_id, 2 * max(1, args.two_pass_max))
             else:
-                missed_seed_papers: list[dict] = []
-                seed_unchecked = 0
-                for sp in seed_papers:
-                    pmid = sp.get("pmid")
-                    doi = sp.get("doi")
-                    if not pmid and not doi:
-                        seed_unchecked += 1
-                        continue
-                    matched = False
-                    if doi:
-                        doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
-                        if llm_results.match_by_doi(doi_norm):
-                            matched = True
-                    if not matched and pmid:
-                        pmid_str = str(pmid).strip()
-                        if llm_results.match_by_pmid(pmid_str):
-                            matched = True
-                    if not matched:
-                        missed_seed_papers.append(sp)
+                max_passes = max(1, args.two_pass_max)
+                pass_stats: list[dict] = []
+                passes_run = 0
 
-                if missed_seed_papers:
-                    log.print(
-                        f"[dim]  Two-pass: {len(missed_seed_papers)} seed paper(s) missed "
-                        f"({seed_unchecked} unchecked)[/dim]"
+                while passes_run < max_passes:
+                    missed_seed_papers, seed_unchecked = get_missed_seed_papers(
+                        seed_papers,
+                        llm_results,
                     )
+                    if not missed_seed_papers:
+                        log.print("[green]  Two-pass: all seed papers captured; stopping[/green]")
+                        break
+
+                    passes_run += 1
+                    log.print(
+                        f"[dim]  Two-pass {passes_run}/{max_passes}: {len(missed_seed_papers)} seed "
+                        f"paper(s) missed ({seed_unchecked} unchecked)[/dim]"
+                    )
+
                     supplement_seed_section = "\n\n" + format_seed_papers(
                         missed_seed_papers,
                         fields=args.seed_fields,
@@ -764,56 +865,102 @@ def run_study(
                         + plan_info
                         + supplement_seed_section
                     )
-                    progress.update(task_id, description="Generating supplement query...")
+                    progress.update(task_id, description=f"Generating supplement query {passes_run}...")
                     resp = client.generate_text(prompt=supplement_prompt)
                     supplement_query = extract_query_from_response(resp.content)
-                    step("Generated supplement query")
+                    step(f"Generated supplement query {passes_run}")
                     log.print(
                         f"[dim]  Tokens: {resp.prompt_tokens} in / {resp.completion_tokens} out, "
                         f"{resp.generation_time:.1f}s[/dim]"
                     )
 
-                    supplement_results = fetch_or_cached(supplement_query, "Supplement query")
+                    if not supplement_query:
+                        log.print("[yellow]Supplement query was empty; stopping[/yellow]")
+                        progress.advance(task_id, 1)
+                        break
+
+                    supplement_results = fetch_or_cached(
+                        supplement_query,
+                        f"Supplement query {passes_run}",
+                    )
                     if supplement_results is None:
-                        log.print("[yellow]Supplement query produced no results[/yellow]")
-                        supplement_stats = {
+                        log.print("[yellow]Supplement query produced no results; stopping[/yellow]")
+                        pass_stats.append({
+                            "pass": passes_run,
                             "missed_seed_count": len(missed_seed_papers),
                             "seed_unchecked": seed_unchecked,
                             "total_pmids": 0,
                             "new_pmids": 0,
                             "dup_pmids": 0,
-                        }
-                    else:
-                        before_pmids = set(llm_results.pmid_map.keys())
-                        before_dois = set(llm_results.doi_map.keys())
-                        supplement_pmids = set(supplement_results.pmid_map.keys())
-                        new_pmids = supplement_pmids - before_pmids
-                        dup_pmids = supplement_pmids & before_pmids
+                        })
+                        break
 
-                        for pmid, info in supplement_results.pmid_map.items():
-                            if pmid not in llm_results.pmid_map:
-                                llm_results.pmid_map[pmid] = info
-                        for doi, info in supplement_results.doi_map.items():
-                            if doi not in llm_results.doi_map:
-                                llm_results.doi_map[doi] = info
+                    before_pmids = set(llm_results.pmid_map.keys())
+                    before_dois = set(llm_results.doi_map.keys())
+                    found_before = count_found_studies(llm_results, included_studies)
+                    supplement_pmids = set(supplement_results.pmid_map.keys())
+                    new_pmids = supplement_pmids - before_pmids
+                    dup_pmids = supplement_pmids & before_pmids
 
-                        llm_results.result_count += len(new_pmids)
-                        log.print(
-                            f"[dim]  Supplement results: {len(supplement_pmids)} total PMIDs, "
-                            f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
-                        )
+                    for pmid, info in supplement_results.pmid_map.items():
+                        if pmid not in llm_results.pmid_map:
+                            llm_results.pmid_map[pmid] = info
+                    for doi, info in supplement_results.doi_map.items():
+                        if doi not in llm_results.doi_map:
+                            llm_results.doi_map[doi] = info
 
-                        supplement_stats = {
-                            "missed_seed_count": len(missed_seed_papers),
-                            "seed_unchecked": seed_unchecked,
-                            "total_pmids": len(supplement_pmids),
-                            "new_pmids": len(new_pmids),
-                            "dup_pmids": len(dup_pmids),
-                            "new_dois": len(set(supplement_results.doi_map.keys()) - before_dois),
-                        }
+                    llm_results.result_count += len(new_pmids)
+
+                    found_after = count_found_studies(llm_results, included_studies)
+                    delta_found = found_after - found_before
+                    total_included = len(included_studies)
+                    recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
+                    recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
+
+                    log.print(
+                        f"[dim]  Supplement {passes_run}: {len(supplement_pmids)} total PMIDs, "
+                        f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
+                    )
+                    log.print(
+                        f"[dim]  Supplement recall: {found_before}->{found_after} "
+                        f"(+{delta_found}) [{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
+                    )
+
+                    pass_stats.append({
+                        "pass": passes_run,
+                        "missed_seed_count": len(missed_seed_papers),
+                        "seed_unchecked": seed_unchecked,
+                        "total_pmids": len(supplement_pmids),
+                        "new_pmids": len(new_pmids),
+                        "dup_pmids": len(dup_pmids),
+                        "new_dois": len(set(supplement_results.doi_map.keys()) - before_dois),
+                        "found_before": found_before,
+                        "found_after": found_after,
+                        "delta_found": delta_found,
+                        "recall_before": recall_before,
+                        "recall_after": recall_after,
+                        "query": supplement_query,
+                    })
+
+                    if not new_pmids:
+                        log.print("[yellow]  Supplement added no new PMIDs; stopping[/yellow]")
+                        break
+
+                if passes_run < max_passes:
+                    progress.advance(task_id, (max_passes - passes_run) * 2)
+
+                if pass_stats:
+                    supplement_stats = {
+                        "passes_run": passes_run,
+                        "max_passes": max_passes,
+                        "passes": pass_stats,
+                    }
                 else:
-                    log.print("[green]  Two-pass: all seed papers captured; skipping supplement[/green]")
-                    progress.advance(task_id, 2)
+                    supplement_stats = {
+                        "passes_run": passes_run,
+                        "max_passes": max_passes,
+                        "passes": [],
+                    }
 
         # Augment with citation searching if enabled
         citation_stats = None
@@ -1032,6 +1179,68 @@ def run_study(
                     citation_stats["doi_total"] = citation_doi_total
                     citation_stats["doi_new"] = citation_doi_new
 
+        # Augment with PubMed "Similar Articles" if enabled
+        similar_stats = None
+        if args.similar > 0 and seed_papers:
+            seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
+            if seed_pmids:
+                found_before = count_found_studies(llm_results, included_studies)
+                total_included = len(included_studies)
+                progress.update(task_id, description="Fetching similar articles...")
+                similar_map = fetch_similar_pmids(
+                    seed_pmids,
+                    email=config.entrez_email,
+                    api_key=config.entrez_api_key,
+                    rate_delay=rate_delay,
+                    per_seed=args.similar,
+                )
+                step("Fetched similar articles")
+                similar_pmids = set()
+                for pmids in similar_map.values():
+                    similar_pmids.update(pmids)
+
+                before_pmids = set(llm_results.pmid_map.keys())
+                new_pmids = similar_pmids - before_pmids
+                dup_pmids = similar_pmids & before_pmids
+
+                for pmid in new_pmids:
+                    llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(similar)"}
+                llm_results.result_count += len(new_pmids)
+
+                found_after = count_found_studies(llm_results, included_studies)
+                delta_found = found_after - found_before
+                if total_included > 0:
+                    recall_before = found_before / total_included * 100
+                    recall_after = found_after / total_included * 100
+                else:
+                    recall_before = 0.0
+                    recall_after = 0.0
+
+                log.print(
+                    f"[dim]  Similar articles: {len(similar_pmids)} total PMIDs, "
+                    f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
+                )
+                log.print(
+                    f"[dim]  Similar recall: {found_before}->{found_after} "
+                    f"(+{delta_found}) "
+                    f"[{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
+                )
+
+                similar_stats = {
+                    "seed_with_pmid": len(seed_pmids),
+                    "per_seed": args.similar,
+                    "total_pmids": len(similar_pmids),
+                    "new_pmids": len(new_pmids),
+                    "dup_pmids": len(dup_pmids),
+                    "found_before": found_before,
+                    "found_after": found_after,
+                    "delta_found": delta_found,
+                    "recall_before": recall_before,
+                    "recall_after": recall_after,
+                }
+            else:
+                log.print("[yellow]Similar articles enabled but no seed PMIDs available[/yellow]")
+
         progress.update(task_id, description="Checking PubMed indexing (LLM)...")
         llm_metrics = calculate_metrics_with_pubmed_check(
             llm_results,
@@ -1152,6 +1361,7 @@ def run_study(
         citation_stats=citation_stats,
         supplement_query=supplement_query,
         supplement_stats=supplement_stats,
+        similar_stats=similar_stats,
     )
 
 
@@ -1181,6 +1391,9 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             f"- **Citation max frontier**: {args.citation_max_frontier or 'none'}"
         )
     lines.append(f"- **Two-pass supplement**: {args.two_pass}")
+    if args.two_pass:
+        lines.append(f"- **Two-pass max**: {args.two_pass_max}")
+    lines.append(f"- **Similar articles per seed**: {args.similar}")
     lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
     lines.append(f"")
 
@@ -1227,19 +1440,49 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             ss = r.supplement_stats
             lines.append("**Supplement pass**")
             lines.append(
-                f"- Missed seed papers: {ss.get('missed_seed_count', 0)} "
-                f"(unchecked: {ss.get('seed_unchecked', 0)})"
+                f"- Passes: {ss.get('passes_run', 0)} / {ss.get('max_passes', 0)}"
+            )
+            for ps in ss.get("passes", []):
+                lines.append(
+                    f"- Pass {ps.get('pass', 0)} missed seeds: {ps.get('missed_seed_count', 0)} "
+                    f"(unchecked: {ps.get('seed_unchecked', 0)})"
+                )
+                lines.append(
+                    f"- Pass {ps.get('pass', 0)} results: {ps.get('total_pmids', 0)} total PMIDs, "
+                    f"{ps.get('new_pmids', 0)} new, {ps.get('dup_pmids', 0)} already in first pass"
+                )
+                if "new_dois" in ps:
+                    lines.append(f"- Pass {ps.get('pass', 0)} DOIs added: {ps.get('new_dois', 0)}")
+                if "found_before" in ps:
+                    lines.append(
+                        f"- Pass {ps.get('pass', 0)} recall impact: {ps.get('found_before', 0)} -> {ps.get('found_after', 0)} "
+                        f"(+{ps.get('delta_found', 0)}), "
+                        f"{ps.get('recall_before', 0.0):.1f}% -> {ps.get('recall_after', 0.0):.1f}%"
+                    )
+                if ps.get("query"):
+                    lines.append("```")
+                    lines.append(ps["query"])
+                    lines.append("```")
+            lines.append(f"")
+        if r.similar_stats:
+            ss = r.similar_stats
+            lines.append("**Similar articles**")
+            lines.append(
+                f"- Seeds with PMID: {ss.get('seed_with_pmid', 0)}"
             )
             lines.append(
-                f"- Supplement results: {ss.get('total_pmids', 0)} total PMIDs, "
+                f"- Per-seed cap: {ss.get('per_seed', 0)}"
+            )
+            lines.append(
+                f"- Similar results: {ss.get('total_pmids', 0)} total PMIDs, "
                 f"{ss.get('new_pmids', 0)} new, {ss.get('dup_pmids', 0)} already in first pass"
             )
-            if "new_dois" in ss:
-                lines.append(f"- Supplement DOIs added: {ss.get('new_dois', 0)}")
-            if r.supplement_query:
-                lines.append("```")
-                lines.append(r.supplement_query)
-                lines.append("```")
+            if "found_before" in ss:
+                lines.append(
+                    f"- Recall impact: {ss.get('found_before', 0)} -> {ss.get('found_after', 0)} "
+                    f"(+{ss.get('delta_found', 0)}), "
+                    f"{ss.get('recall_before', 0.0):.1f}% -> {ss.get('recall_after', 0.0):.1f}%"
+                )
             lines.append(f"")
 
     # Summary table if multiple studies
@@ -1431,6 +1674,18 @@ def main():
         "--two-pass",
         action="store_true",
         help="Generate a supplementary query for missed seed papers and merge results",
+    )
+    parser.add_argument(
+        "--two-pass-max",
+        type=int,
+        default=3,
+        help="Maximum number of supplementary passes to run (default: 3)",
+    )
+    parser.add_argument(
+        "--similar",
+        type=int,
+        default=0,
+        help="Fetch up to N similar articles per seed paper and merge results (0 = disabled)",
     )
     parser.add_argument(
         "--citation-depth",
