@@ -260,7 +260,7 @@ class OpenAlexClient:
         cache: CitationCache | None = None,
         max_forward: int = 2000,
         direction: str = "both",
-    ) -> tuple[CitationResult, list[str]]:
+    ) -> tuple[CitationResult, list[str], bool]:
         """Get citation PMIDs and OpenAlex work IDs for a PMID."""
         cached_result: CitationResult | None = None
         if cache:
@@ -279,7 +279,7 @@ class OpenAlexClient:
             logger.info("PMID %s not found in OpenAlex", pmid)
             if cache and not cached_result:
                 cache.set(pmid, [], [], save=False)
-            return result, []
+            return result, [], False
 
         forward_pmids: set[str] = set()
         forward_ids: list[str] = []
@@ -311,7 +311,7 @@ class OpenAlexClient:
             all_ids.extend(referenced_works)
         if direction in ("both", "forward") and forward_ids:
             all_ids.extend(forward_ids)
-        return result, all_ids
+        return result, all_ids, True
 
     def get_citations_for_work_id(
         self,

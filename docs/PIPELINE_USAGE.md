@@ -135,6 +135,7 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 | `--citation-depth N` | Citation expansion depth (1 = direct citations only). |
 | `--citation-direction {both,forward,backward}` | Citation direction to follow (default: both). |
 | `--citation-max-frontier N` | Cap number of works expanded at each depth (0 = no cap). |
+| `--two-pass` | Generate a supplementary query for missed seed papers and merge results. |
 | `--show-missed` | Append a "Missed Papers" section to the results file listing PubMed-indexed papers not captured by the query, with title, abstract, MeSH terms, and keywords (enriched from `seed_papers/` cache). |
 | `--save-prompt` | Append the full composed LLM prompt to the results file. |
 | `--no-human` | Skip human strategy comparison. |

@@ -73,6 +73,21 @@ Output:
 Return the final PubMed Boolean query in one line only.
 """
 
+SUPPLEMENT_PROMPT = """\
+You previously generated a PubMed Boolean query for this systematic review, but it missed some known relevant papers.
+
+Task:
+Generate a supplementary PubMed query (not a full rewrite) that would capture the missed papers.
+
+Rules:
+- Focus on missing vocabulary and indexing terms.
+- Do NOT repeat the original query.
+- This supplementary query will be run separately and results will be merged.
+
+Output:
+Return the supplementary PubMed Boolean query in one line only.
+"""
+
 EXTRACT_PROMPT = """\
 Extract the systematic review plan from this PROSPERO protocol document. Use the exact wording from the document — do not paraphrase or interpret.
 
@@ -251,10 +266,12 @@ class StudyResult:
     query_prompt: str | None = None
     missed_papers: list[dict] | None = None
     citation_stats: dict | None = None  # {total, new, hits}
+    supplement_query: str | None = None
+    supplement_stats: dict | None = None
     error: str | None = None
 
 
-def _calculate_total_steps(n_runs: int, include_human: bool) -> int:
+def _calculate_total_steps(n_runs: int, include_human: bool, two_pass: bool) -> int:
     """Calculate the total number of progress steps for a study pipeline.
 
     Steps:
@@ -266,6 +283,8 @@ def _calculate_total_steps(n_runs: int, include_human: bool) -> int:
       6-8. (if human) Extract/load strategy, fetch PubMed, evaluate metrics
     """
     total = 2 + n_runs + 1 + 1  # load + extract + generate(n) + fetch(1) + evaluate
+    if two_pass:
+        total += 2  # supplement LLM + supplement fetch
     if include_human:
         total += 3  # strategy extract + fetch + evaluate
     return total
@@ -565,7 +584,7 @@ def run_study(
 
     n_runs = args.n
     include_human = not args.no_human and study.search_strategy_docx is not None
-    total_steps = _calculate_total_steps(n_runs, include_human)
+    total_steps = _calculate_total_steps(n_runs, include_human, args.two_pass)
 
     progress = Progress(
         SpinnerColumn(),
@@ -699,6 +718,103 @@ def run_study(
             log.print("[red]No valid query results[/red]")
             return None
 
+        supplement_query = None
+        supplement_stats = None
+
+        # Optional two-pass refinement: generate a supplemental query for missed seed papers
+        if args.two_pass:
+            if not seed_papers:
+                log.print("[yellow]Two-pass enabled but no seed papers available; skipping[/yellow]")
+                progress.advance(task_id, 2)
+            else:
+                missed_seed_papers: list[dict] = []
+                seed_unchecked = 0
+                for sp in seed_papers:
+                    pmid = sp.get("pmid")
+                    doi = sp.get("doi")
+                    if not pmid and not doi:
+                        seed_unchecked += 1
+                        continue
+                    matched = False
+                    if doi:
+                        doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
+                        if llm_results.match_by_doi(doi_norm):
+                            matched = True
+                    if not matched and pmid:
+                        pmid_str = str(pmid).strip()
+                        if llm_results.match_by_pmid(pmid_str):
+                            matched = True
+                    if not matched:
+                        missed_seed_papers.append(sp)
+
+                if missed_seed_papers:
+                    log.print(
+                        f"[dim]  Two-pass: {len(missed_seed_papers)} seed paper(s) missed "
+                        f"({seed_unchecked} unchecked)[/dim]"
+                    )
+                    supplement_seed_section = "\n\n" + format_seed_papers(
+                        missed_seed_papers,
+                        fields=args.seed_fields,
+                    )
+                    supplement_prompt = (
+                        SUPPLEMENT_PROMPT
+                        + "\n\nOriginal query:\n"
+                        + final_query
+                        + "\n\n"
+                        + plan_info
+                        + supplement_seed_section
+                    )
+                    progress.update(task_id, description="Generating supplement query...")
+                    resp = client.generate_text(prompt=supplement_prompt)
+                    supplement_query = extract_query_from_response(resp.content)
+                    step("Generated supplement query")
+                    log.print(
+                        f"[dim]  Tokens: {resp.prompt_tokens} in / {resp.completion_tokens} out, "
+                        f"{resp.generation_time:.1f}s[/dim]"
+                    )
+
+                    supplement_results = fetch_or_cached(supplement_query, "Supplement query")
+                    if supplement_results is None:
+                        log.print("[yellow]Supplement query produced no results[/yellow]")
+                        supplement_stats = {
+                            "missed_seed_count": len(missed_seed_papers),
+                            "seed_unchecked": seed_unchecked,
+                            "total_pmids": 0,
+                            "new_pmids": 0,
+                            "dup_pmids": 0,
+                        }
+                    else:
+                        before_pmids = set(llm_results.pmid_map.keys())
+                        before_dois = set(llm_results.doi_map.keys())
+                        supplement_pmids = set(supplement_results.pmid_map.keys())
+                        new_pmids = supplement_pmids - before_pmids
+                        dup_pmids = supplement_pmids & before_pmids
+
+                        for pmid, info in supplement_results.pmid_map.items():
+                            if pmid not in llm_results.pmid_map:
+                                llm_results.pmid_map[pmid] = info
+                        for doi, info in supplement_results.doi_map.items():
+                            if doi not in llm_results.doi_map:
+                                llm_results.doi_map[doi] = info
+
+                        llm_results.result_count += len(new_pmids)
+                        log.print(
+                            f"[dim]  Supplement results: {len(supplement_pmids)} total PMIDs, "
+                            f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
+                        )
+
+                        supplement_stats = {
+                            "missed_seed_count": len(missed_seed_papers),
+                            "seed_unchecked": seed_unchecked,
+                            "total_pmids": len(supplement_pmids),
+                            "new_pmids": len(new_pmids),
+                            "dup_pmids": len(dup_pmids),
+                            "new_dois": len(set(supplement_results.doi_map.keys()) - before_dois),
+                        }
+                else:
+                    log.print("[green]  Two-pass: all seed papers captured; skipping supplement[/green]")
+                    progress.advance(task_id, 2)
+
         # Augment with citation searching if enabled
         citation_stats = None
         if args.citations and args.seeds > 0 and seed_papers:
@@ -720,14 +836,22 @@ def run_study(
             max_frontier = int(getattr(args, "citation_max_frontier", 0))
             frontier_ids: set[str] = set()
             visited_ids: set[str] = set()
+            seed_missing_pmid: list[str] = []
+            seed_not_found_openalex: list[str] = []
 
-            for sp_pmid in seed_pmids:
+            for sp in seed_papers:
+                sp_pmid = sp.get("pmid")
+                if not sp_pmid:
+                    seed_missing_pmid.append(sp.get("title") or "unknown title")
+                    continue
                 progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
-                cr, work_ids = oa_client.get_citations_with_work_ids(
+                cr, work_ids, found = oa_client.get_citations_with_work_ids(
                     sp_pmid,
                     cache=citation_cache,
                     direction=direction,
                 )
+                if not found:
+                    seed_not_found_openalex.append(sp_pmid)
                 citation_pmids |= cr.all_pmids
                 for wid in work_ids:
                     if not wid:
@@ -738,6 +862,16 @@ def run_study(
                 log.print(
                     f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
                     f"{len(cr.backward_pmids)} backward[/dim]"
+                )
+
+            if seed_missing_pmid:
+                log.print(
+                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) missing PMID; "
+                    "skipping for citations[/yellow]"
+                )
+            if seed_not_found_openalex:
+                log.print(
+                    f"[yellow]  {len(seed_not_found_openalex)} seed PMID(s) not found in OpenAlex (skipping depth expansion for them)[/yellow]"
                 )
 
             if depth > 1 and frontier_ids:
@@ -774,12 +908,26 @@ def run_study(
             query_pmids_set = set(llm_results.pmid_map.keys())
             new_pmids = citation_pmids - query_pmids_set
 
+            if seed_pmids:
+                missing_seed_pmids = [p for p in seed_pmids if p not in query_pmids_set]
+                if not missing_seed_pmids:
+                    log.print("[green]  All seed PMIDs were captured in the first-pass query[/green]")
+                else:
+                    log.print(
+                        f"[yellow]  {len(missing_seed_pmids)} seed PMID(s) not captured in the first-pass query[/yellow]"
+                    )
+
             # Included studies found via citations
             citation_included_all = citation_pmids & included_pmids
             citation_already_in_query = citation_included_all & query_pmids_set
             citation_hits = citation_included_all - query_pmids_set  # truly new
 
             # Add citation PMIDs to the search results
+            citation_overlap = citation_pmids & query_pmids_set
+            log.print(
+                f"[dim]  Citation pass (depth {depth}) total {len(citation_pmids)} PMIDs: "
+                f"{len(new_pmids)} new, {len(citation_overlap)} already in query[/dim]"
+            )
             citation_stats = {
                 "total": len(citation_pmids),
                 "new": len(new_pmids),
@@ -787,6 +935,13 @@ def run_study(
                 "hits_already_in_query": len(citation_already_in_query),
                 "hits_total": len(citation_included_all),
                 "query_count": query_pmid_count,
+                "seed_total": len(seed_papers),
+                "seed_with_pmid": len(seed_pmids),
+                "seed_missing_pmid": len(seed_missing_pmid),
+                "seed_not_found_openalex": len(seed_not_found_openalex),
+                "depth": depth,
+                "direction": direction,
+                "max_frontier": max_frontier,
             }
 
             if new_pmids:
@@ -995,6 +1150,8 @@ def run_study(
         query_prompt=query_prompt,
         missed_papers=missed_papers,
         citation_stats=citation_stats,
+        supplement_query=supplement_query,
+        supplement_stats=supplement_stats,
     )
 
 
@@ -1017,6 +1174,13 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     lines.append(f"- **Double prompt**: {args.double_prompt}")
     lines.append(f"- **Seed papers**: {args.seeds}")
     lines.append(f"- **Citations**: {args.citations}")
+    if args.citations:
+        lines.append(f"- **Citation depth**: {args.citation_depth}")
+        lines.append(f"- **Citation direction**: {args.citation_direction}")
+        lines.append(
+            f"- **Citation max frontier**: {args.citation_max_frontier or 'none'}"
+        )
+    lines.append(f"- **Two-pass supplement**: {args.two_pass}")
     lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
     lines.append(f"")
 
@@ -1042,9 +1206,41 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
         lines.append(f"| NNR | {nnr_str} | {h_nnr_str} |")
         if r.citation_stats:
             cs = r.citation_stats
+            lines.append(
+                f"| **Citations** | depth {cs.get('depth', 1)}, {cs.get('direction', 'both')}, "
+                f"cap {cs.get('max_frontier', 0) or 'none'} | — |"
+            )
             lines.append(f"| **Citation PMIDs** | {cs['total']} total, {cs['new']} new | — |")
-            lines.append(f"| **Citation included** | {cs['hits_total']} found ({cs['hits']} new, {cs['hits_already_in_query']} already in query) | — |")
+            if "doi_total" in cs:
+                lines.append(f"| **Citation DOIs** | {cs['doi_total']} total, {cs['doi_new']} new | — |")
+            lines.append(
+                f"| **Citation included** | {cs['hits_total']} found ({cs['hits']} new, "
+                f"{cs['hits_already_in_query']} already in query) | — |"
+            )
+            lines.append(
+                f"| **Seed papers** | {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID, "
+                f"{cs.get('seed_missing_pmid', 0)} missing PMID, "
+                f"{cs.get('seed_not_found_openalex', 0)} not in OpenAlex | — |"
+            )
         lines.append(f"")
+        if r.supplement_stats:
+            ss = r.supplement_stats
+            lines.append("**Supplement pass**")
+            lines.append(
+                f"- Missed seed papers: {ss.get('missed_seed_count', 0)} "
+                f"(unchecked: {ss.get('seed_unchecked', 0)})"
+            )
+            lines.append(
+                f"- Supplement results: {ss.get('total_pmids', 0)} total PMIDs, "
+                f"{ss.get('new_pmids', 0)} new, {ss.get('dup_pmids', 0)} already in first pass"
+            )
+            if "new_dois" in ss:
+                lines.append(f"- Supplement DOIs added: {ss.get('new_dois', 0)}")
+            if r.supplement_query:
+                lines.append("```")
+                lines.append(r.supplement_query)
+                lines.append("```")
+            lines.append(f"")
 
     # Summary table if multiple studies
     if len(results) > 1:
@@ -1230,6 +1426,11 @@ def main():
         "--citations",
         action="store_true",
         help="Augment query results with forward/backward citations of seed papers via OpenAlex (requires --seeds)",
+    )
+    parser.add_argument(
+        "--two-pass",
+        action="store_true",
+        help="Generate a supplementary query for missed seed papers and merge results",
     )
     parser.add_argument(
         "--citation-depth",
