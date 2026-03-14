@@ -20,6 +20,8 @@ class PipelineConfig:
 
     entrez_email: str = "user@example.com"
     entrez_api_key: str | None = None
+    openalex_email: str | None = None
+    openalex_api_key: str | None = None
 
     max_pubmed_results: int = 10000
     pubmed_batch_size: int = 200
@@ -46,6 +48,8 @@ class PipelineConfig:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-2026-03-05"),
             entrez_email=os.getenv("ENTREZ_EMAIL", "user@example.com"),
             entrez_api_key=os.getenv("ENTREZ_API_KEY") or os.getenv("PUBMED_API_KEY"),
+            openalex_email=os.getenv("OPENALEX_EMAIL"),
+            openalex_api_key=os.getenv("OPENALEX_API_KEY"),
             max_pubmed_results=int(os.getenv("MAX_PUBMED_RESULTS", "10000")),
             pubmed_batch_size=int(os.getenv("PUBMED_BATCH_SIZE", "200")),
         )

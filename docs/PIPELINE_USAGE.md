@@ -23,6 +23,12 @@ PUBMED_API_KEY=your-ncbi-api-key
 
 # Email for NCBI Entrez API (required by NCBI)
 ENTREZ_EMAIL=your-email@example.com
+
+# Optional: OpenAlex API (required for higher rate limits)
+OPENALEX_API_KEY=your-openalex-api-key
+
+# Optional: contact email for OpenAlex requests
+OPENALEX_EMAIL=your-email@example.com
 ```
 
 ## Commands
@@ -107,8 +113,14 @@ uv run python generate_query.py 34 -n 3
 # Repeat the prompt twice in a single message for emphasis
 uv run python generate_query.py 34 --double-prompt
 
+# Include 3 random seed papers (from seed_papers/) in the prompt
+uv run python generate_query.py 34 --seeds 3
+
+# Augment results with forward/backward citations of seed papers via OpenAlex
+uv run python generate_query.py 34 --seeds 3 --citations
+
 # Combine options
-uv run python generate_query.py 34 35 -n 3 --double-prompt --no-human
+uv run python generate_query.py 34 35 -n 3 --double-prompt --seeds 3 --citations --no-human
 ```
 
 The script runs two LLM calls: first extracting the structured plan from the PDF, then generating a query from that plan. The model and prompts are configured at the top of `generate_query.py` (`MODEL`, `EXTRACT_PROMPT`, `QUERY_PROMPT`).
@@ -117,6 +129,14 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 |------|-------------|
 | `-n N` | Run query generation N times per study and merge results (union of PMIDs). LLM calls run in parallel. |
 | `--double-prompt` | Repeat the full query prompt twice in a single message for emphasis. |
+| `--seeds N` | Include N random seed papers (title, abstract, MeSH, keywords) from `seed_papers/` in the prompt. Papers with missing data are skipped. Default 0 (disabled). |
+| `--seed-fields CODES` | Control which seed paper fields to include: `t`=title, `a`=abstract, `m`=MeSH, `k`=keywords. Default `tamk` (all). E.g. `--seed-fields tm` for title + MeSH only. |
+| `--citations` | Augment query results with forward/backward citations of seed papers via the OpenAlex API. Requires `--seeds`. Unions citation PMIDs with Boolean query PMIDs before evaluation. |
+| `--citation-depth N` | Citation expansion depth (1 = direct citations only). |
+| `--citation-direction {both,forward,backward}` | Citation direction to follow (default: both). |
+| `--citation-max-frontier N` | Cap number of works expanded at each depth (0 = no cap). |
+| `--show-missed` | Append a "Missed Papers" section to the results file listing PubMed-indexed papers not captured by the query, with title, abstract, MeSH terms, and keywords (enriched from `seed_papers/` cache). |
+| `--save-prompt` | Append the full composed LLM prompt to the results file. |
 | `--no-human` | Skip human strategy comparison. |
 | `--extract` | Extract the systematic review plan only (no query generation). |
 

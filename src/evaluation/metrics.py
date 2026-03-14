@@ -163,6 +163,7 @@ def calculate_metrics(
 
     # Count matches
     found = 0
+    found_pubmed = 0
     for study in included_studies:
         match = None
         if study.doi:
@@ -171,13 +172,15 @@ def calculate_metrics(
             match = search_results.match_by_pmid(study.pmid)
         if match:
             found += 1
+            if match.get("pmid"):
+                found_pubmed += 1
 
     missed = total_included - found
     pubmed_indexed = total_included - not_in_pubmed_count
 
     # Calculate metrics
     recall_overall = found / total_included if total_included > 0 else 0.0
-    recall_pubmed = found / pubmed_indexed if pubmed_indexed > 0 else 0.0
+    recall_pubmed = found_pubmed / pubmed_indexed if pubmed_indexed > 0 else 0.0
     precision = found / total_results if total_results > 0 else 0.0
     nnr = total_results / found if found > 0 else float("inf")
 
@@ -225,6 +228,7 @@ def calculate_metrics_with_pubmed_check(
 
     # Match studies and identify missed ones
     found_studies = []
+    found_pubmed = []
     missed_studies = []
 
     for study in included_studies:
@@ -236,10 +240,15 @@ def calculate_metrics_with_pubmed_check(
 
         if match:
             found_studies.append(study)
+            if match.get("pmid"):
+                found_pubmed.append(study)
+            else:
+                missed_studies.append(study)
         else:
             missed_studies.append(study)
 
     found = len(found_studies)
+    found_pubmed_count = len(found_pubmed)
     missed = len(missed_studies)
 
     # Check which missed studies are actually indexed in PubMed (batch lookup)
@@ -258,7 +267,7 @@ def calculate_metrics_with_pubmed_check(
 
     # Calculate metrics
     recall_overall = found / total_included if total_included > 0 else 0.0
-    recall_pubmed = found / pubmed_indexed if pubmed_indexed > 0 else 0.0
+    recall_pubmed = found_pubmed_count / pubmed_indexed if pubmed_indexed > 0 else 0.0
     precision = found / total_results if total_results > 0 else 0.0
     nnr = total_results / found if found > 0 else float("inf")
 

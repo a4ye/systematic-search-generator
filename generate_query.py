@@ -1,8 +1,11 @@
 """Generate a PubMed query from a PROSPERO PDF using a single-shot prompt, then evaluate it."""
 
 import argparse
+import json
+import random
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,11 +15,13 @@ from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 
+from Bio import Entrez, Medline
+
 from src.cache.pubmed_index_cache import PubMedIndexCache
 from src.cache.query_results_cache import QueryResultsCache
 from src.compare_search import extract_included_studies
 from src.discovery.study_finder import StudyFinder
-from src.evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check
+from src.evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check, match_studies
 from src.llm.openai_client import OpenAIClient
 from src.pipeline.config import PipelineConfig
 from src.pubmed.search_executor import PubMedExecutor, PubMedSearchResults
@@ -28,7 +33,7 @@ QUERY_PROMPT = """\
 Given a systematic review plan, generate a PubMed Boolean search query optimized for systematic review searching (target roughly <20,000 PubMed results).
 
 Goal:
-Maximize sensitivity while great reasonable precision.
+Maximize sensitivity.
 
 Instructions:
 
@@ -62,6 +67,8 @@ Instructions:
     - remove redundant synonyms
     - avoid unnecessary numeric age phrases.
 
+11. If known relevant papers are provided below, use their MeSH terms, keywords, and vocabulary to inform your term selection. Ensure the query would plausibly retrieve these papers.
+
 Output:
 Return the final PubMed Boolean query in one line only.
 """
@@ -94,6 +101,139 @@ Important:
 """
 
 
+SEED_PAPERS_DIR = Path("seed_papers")
+
+
+def load_seed_papers(study_id: str, study_name: str, n: int) -> list[dict] | None:
+    """Load n random valid seed papers for a study.
+
+    Skips papers that are missing title and abstract (broken/empty entries).
+    Returns None if no seed paper file exists for this study.
+    """
+    # Try exact match first, then fallback to ID prefix
+    path = SEED_PAPERS_DIR / f"{study_id} - {study_name}.json"
+    if not path.exists():
+        matches = list(SEED_PAPERS_DIR.glob(f"{study_id} - *.json"))
+        if not matches:
+            return None
+        path = matches[0]
+
+    with open(path) as f:
+        data = json.load(f)
+
+    papers = data.get("papers", [])
+    # Filter out broken/empty entries
+    valid = [p for p in papers if p.get("title") and p.get("abstract")]
+    if not valid:
+        return None
+
+    if len(valid) <= n:
+        return valid
+
+    sampled = random.sample(valid, n)
+    return sampled
+
+
+# Mapping from single-letter codes to seed paper fields
+SEED_FIELD_CODES = {
+    "t": "title",
+    "a": "abstract",
+    "m": "mesh_terms",
+    "k": "keywords",
+}
+
+
+def format_seed_papers(papers: list[dict], fields: str = "tamk") -> str:
+    """Format seed papers into a text block for the LLM prompt.
+
+    Fields is a string of single-letter codes controlling which parts to include:
+      t = title, a = abstract, m = MeSH terms, k = keywords
+    """
+    lines = []
+    lines.append("Here are some known relevant papers that should be captured by the search:")
+    lines.append("")
+    for i, p in enumerate(papers, 1):
+        lines.append(f"Paper {i}:")
+        if "t" in fields and p.get("title"):
+            lines.append(f"  Title: {p['title']}")
+        if "a" in fields and p.get("abstract"):
+            abstract = p["abstract"]
+            if len(abstract) > 800:
+                abstract = abstract[:800] + "..."
+            lines.append(f"  Abstract: {abstract}")
+        if "m" in fields and p.get("mesh_terms"):
+            lines.append(f"  MeSH Terms: {', '.join(p['mesh_terms'])}")
+        if "k" in fields and p.get("keywords"):
+            lines.append(f"  Keywords: {', '.join(p['keywords'])}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Citation DOI enrichment helpers
+# ---------------------------------------------------------------------------
+
+def _extract_dois_from_medline_record(record: dict) -> list[str]:
+    """Extract DOI(s) from a MEDLINE record."""
+    dois = set()
+    for aid in record.get("AID", []):
+        if "[doi]" in aid:
+            doi = aid.replace("[doi]", "").strip().lower()
+            if doi:
+                dois.add(doi)
+
+    lid = record.get("LID", "")
+    if isinstance(lid, list):
+        lid = " ".join(lid)
+    if "[doi]" in lid:
+        doi = lid.split("[doi]")[0].strip().lower()
+        if doi:
+            dois.add(doi)
+
+    return sorted(dois)
+
+
+def fetch_dois_for_pmids(
+    pmids: list[str],
+    email: str,
+    api_key: str | None,
+    rate_delay: float,
+    batch_size: int = 200,
+) -> dict[str, list[str]]:
+    """Fetch DOI mappings for PMIDs via Entrez MEDLINE."""
+    if not pmids:
+        return {}
+
+    Entrez.email = email
+    if api_key:
+        Entrez.api_key = api_key
+
+    pmid_to_dois: dict[str, list[str]] = {}
+    for start in range(0, len(pmids), batch_size):
+        batch = pmids[start:start + batch_size]
+        time.sleep(rate_delay)
+        handle = Entrez.efetch(
+            db="pubmed",
+            id=",".join(batch),
+            rettype="medline",
+            retmode="text",
+        )
+        try:
+            records = list(Medline.parse(handle))
+        finally:
+            handle.close()
+
+        for rec in records:
+            pmid = rec.get("PMID")
+            if not pmid:
+                continue
+            dois = _extract_dois_from_medline_record(rec)
+            if dois:
+                pmid_to_dois[pmid] = dois
+
+    return pmid_to_dois
+
+
 # ── End configuration ────────────────────────────────────────────────────────
 
 
@@ -108,6 +248,9 @@ class StudyResult:
     llm_queries: list[str] | None = None
     merged_query: str | None = None
     human_query: str | None = None
+    query_prompt: str | None = None
+    missed_papers: list[dict] | None = None
+    citation_stats: dict | None = None  # {total, new, hits}
     error: str | None = None
 
 
@@ -462,8 +605,21 @@ def run_study(
             f"{extract_response.generation_time:.1f}s[/dim]"
         )
 
-        # Step 2: Generate query from extracted plan
-        query_prompt = QUERY_PROMPT + "\n" + plan_info
+        # Step 2: Load seed papers if requested
+        seed_section = ""
+        seed_papers = None
+        if args.seeds > 0:
+            progress.update(task_id, description="Loading seed papers...")
+            seed_papers = load_seed_papers(study.study_id, study.name, args.seeds)
+            if seed_papers:
+                seed_section = "\n\n" + format_seed_papers(seed_papers, fields=args.seed_fields)
+                field_names = [SEED_FIELD_CODES[c] for c in args.seed_fields if c in SEED_FIELD_CODES]
+                log.print(f"[dim]  Loaded {len(seed_papers)} seed papers ({', '.join(field_names)})[/dim]")
+            else:
+                log.print("[yellow]  No valid seed papers found for this study[/yellow]")
+
+        # Step 3: Generate query from extracted plan
+        query_prompt = QUERY_PROMPT + "\n" + plan_info + seed_section
         if args.double_prompt:
             query_prompt = query_prompt + "\n\n---\n\n" + query_prompt
             log.print("[dim]  (prompt doubled)[/dim]")
@@ -543,6 +699,184 @@ def run_study(
             log.print("[red]No valid query results[/red]")
             return None
 
+        # Augment with citation searching if enabled
+        citation_stats = None
+        if args.citations and args.seeds > 0 and seed_papers:
+            from src.cache.citation_cache import CitationCache
+            from src.citation.openalex import OpenAlexClient as OAClient
+
+            citation_cache = CitationCache(config.cache_dir)
+            oa_client = OAClient(
+                email=config.openalex_email or config.entrez_email,
+                api_key=config.openalex_api_key,
+            )
+
+            seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
+            query_pmid_count = len(llm_results.pmid_map)
+            citation_pmids: set[str] = set()
+            citation_openalex_ids: set[str] = set()
+            depth = max(1, int(getattr(args, "citation_depth", 1)))
+            direction = getattr(args, "citation_direction", "both")
+            max_frontier = int(getattr(args, "citation_max_frontier", 0))
+            frontier_ids: set[str] = set()
+            visited_ids: set[str] = set()
+
+            for sp_pmid in seed_pmids:
+                progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
+                cr, work_ids = oa_client.get_citations_with_work_ids(
+                    sp_pmid,
+                    cache=citation_cache,
+                    direction=direction,
+                )
+                citation_pmids |= cr.all_pmids
+                for wid in work_ids:
+                    if not wid:
+                        continue
+                    citation_openalex_ids.add(wid)
+                    frontier_ids.add(wid)
+                    visited_ids.add(wid)
+                log.print(
+                    f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
+                    f"{len(cr.backward_pmids)} backward[/dim]"
+                )
+
+            if depth > 1 and frontier_ids:
+                for level in range(2, depth + 1):
+                    progress.update(task_id, description=f"Citations depth {level}...")
+                    next_frontier: set[str] = set()
+                    frontier_list = sorted(frontier_ids)
+                    if max_frontier > 0 and len(frontier_list) > max_frontier:
+                        frontier_list = frontier_list[:max_frontier]
+                        log.print(
+                            f"[dim]  Depth {level}: capped frontier to {len(frontier_list)} works[/dim]"
+                        )
+                    for oa_id in frontier_list:
+                        pmids, work_ids = oa_client.get_citations_for_work_id(
+                            oa_id,
+                            direction=direction,
+                        )
+                        citation_pmids |= pmids
+                        for wid in work_ids:
+                            if not wid:
+                                continue
+                            citation_openalex_ids.add(wid)
+                            if wid not in visited_ids:
+                                visited_ids.add(wid)
+                                next_frontier.add(wid)
+                    if not next_frontier:
+                        break
+                    frontier_ids = next_frontier
+
+            citation_cache.save()
+
+            # Check how many citation PMIDs match included studies
+            included_pmids = {s.pmid for s in included_studies if s.pmid}
+            query_pmids_set = set(llm_results.pmid_map.keys())
+            new_pmids = citation_pmids - query_pmids_set
+
+            # Included studies found via citations
+            citation_included_all = citation_pmids & included_pmids
+            citation_already_in_query = citation_included_all & query_pmids_set
+            citation_hits = citation_included_all - query_pmids_set  # truly new
+
+            # Add citation PMIDs to the search results
+            citation_stats = {
+                "total": len(citation_pmids),
+                "new": len(new_pmids),
+                "hits": len(citation_hits),
+                "hits_already_in_query": len(citation_already_in_query),
+                "hits_total": len(citation_included_all),
+                "query_count": query_pmid_count,
+            }
+
+            if new_pmids:
+                for pmid in new_pmids:
+                    llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(citation)"}
+                llm_results.result_count += len(new_pmids)
+                log.print(
+                    f"[dim]  Citations added {len(new_pmids)} new PMIDs "
+                    f"({query_pmid_count} query + {len(new_pmids)} citations "
+                    f"= {len(llm_results.pmid_map)} total)[/dim]"
+                )
+                # Enrich citation PMIDs with DOIs so DOI-only included studies can match
+                pmid_list = sorted(new_pmids)
+                pmid_to_dois: dict[str, list[str]] = {}
+
+                # OpenAlex first (fast, polite pool)
+                oa_doi_map = oa_client.resolve_pmids_to_dois(pmid_list)
+                if oa_doi_map:
+                    for pmid, doi in oa_doi_map.items():
+                        pmid_to_dois[pmid] = [doi]
+
+                # Fallback to Entrez for missing DOIs
+                missing_pmids = [pmid for pmid in pmid_list if pmid not in pmid_to_dois]
+                if missing_pmids:
+                    try:
+                        entrez_dois = fetch_dois_for_pmids(
+                            missing_pmids,
+                            email=config.entrez_email,
+                            api_key=config.entrez_api_key,
+                            rate_delay=rate_delay,
+                            batch_size=config.pubmed_batch_size,
+                        )
+                        for pmid, dois in entrez_dois.items():
+                            pmid_to_dois[pmid] = dois
+                    except Exception as exc:
+                        log.print(f"[yellow]  DOI enrichment via Entrez failed: {exc}[/yellow]")
+
+                if pmid_to_dois:
+                    enriched = 0
+                    for pmid, dois in pmid_to_dois.items():
+                        entry = llm_results.pmid_map.get(pmid)
+                        if entry is None:
+                            entry = {"pmid": pmid, "title": "(citation)"}
+                            llm_results.pmid_map[pmid] = entry
+                        existing = set(entry.get("dois", []))
+                        for doi in dois:
+                            if doi not in existing:
+                                existing.add(doi)
+                                enriched += 1
+                            llm_results.doi_map[doi] = {
+                                "pmid": pmid,
+                                "title": entry.get("title", "(citation)"),
+                            }
+                        entry["dois"] = sorted(existing)
+                    log.print(f"[dim]  Enriched {enriched} DOI mappings for citations[/dim]")
+                if citation_included_all:
+                    parts = []
+                    parts.append(f"{len(citation_included_all)} included studies in citations")
+                    if citation_hits:
+                        parts.append(f"{len(citation_hits)} new (not in query)")
+                    if citation_already_in_query:
+                        parts.append(f"{len(citation_already_in_query)} already in query")
+                    log.print(f"[green]  {', '.join(parts)}[/green]")
+                else:
+                    log.print("[dim]  No included studies found via citations[/dim]")
+            else:
+                log.print("[dim]  No new PMIDs from citations[/dim]")
+
+            # Add DOI-only citation results (OpenAlex works without PMIDs)
+            citation_doi_new = 0
+            citation_doi_total = 0
+            if citation_openalex_ids:
+                id_to_doi = oa_client.resolve_openalex_ids_to_dois(sorted(citation_openalex_ids))
+                if id_to_doi:
+                    for doi in id_to_doi.values():
+                        if not doi:
+                            continue
+                        citation_doi_total += 1
+                        if doi in llm_results.doi_map:
+                            continue
+                        llm_results.doi_map[doi] = {"pmid": None, "title": "(citation)"}
+                        citation_doi_new += 1
+
+                    if citation_doi_new:
+                        llm_results.result_count += citation_doi_new
+                        log.print(f"[dim]  Added {citation_doi_new} DOI-only citation results[/dim]")
+
+                    citation_stats["doi_total"] = citation_doi_total
+                    citation_stats["doi_new"] = citation_doi_new
+
         progress.update(task_id, description="Checking PubMed indexing (LLM)...")
         llm_metrics = calculate_metrics_with_pubmed_check(
             llm_results,
@@ -552,6 +886,53 @@ def run_study(
             index_cache=index_cache,
         )
         step("Checked PubMed indexing (LLM)")
+
+        # Identify missed papers (PubMed-indexed only, enriched with seed paper metadata)
+        match_results = match_studies(llm_results, included_studies)
+        missed_studies = [mr.study for mr in match_results if not mr.matched]
+
+        # Load seed papers JSON to enrich missed papers with metadata
+        seed_lookup: dict[str, dict] = {}
+        seed_path = SEED_PAPERS_DIR / f"{study.study_id} - {study.name}.json"
+        if not seed_path.exists():
+            seed_matches = list(SEED_PAPERS_DIR.glob(f"{study.study_id} - *.json"))
+            if seed_matches:
+                seed_path = seed_matches[0]
+        if seed_path.exists():
+            with open(seed_path) as f:
+                seed_data = json.load(f)
+            for sp in seed_data.get("papers", []):
+                if sp.get("pmid"):
+                    seed_lookup[sp["pmid"]] = sp
+                if sp.get("doi"):
+                    seed_lookup[sp["doi"].lower()] = sp
+
+        missed_papers = []
+        for ms in missed_studies:
+            # Only include PubMed-indexed papers (check via index_cache, populated earlier)
+            cached_status = index_cache.get(doi=ms.doi, pmid=ms.pmid)
+            if cached_status is False:
+                continue
+            # If not cached at all and no PMID, skip (likely not in PubMed)
+            if cached_status is None and not ms.pmid:
+                continue
+            # Try to enrich from seed papers cache
+            enriched = (seed_lookup.get(ms.pmid) if ms.pmid else None) or (seed_lookup.get(ms.doi) if ms.doi else None)
+            if enriched:
+                missed_papers.append({
+                    "title": enriched.get("title") or ms.title,
+                    "doi": enriched.get("doi") or ms.doi,
+                    "pmid": enriched.get("pmid") or ms.pmid,
+                    "abstract": enriched.get("abstract"),
+                    "mesh_terms": enriched.get("mesh_terms"),
+                    "keywords": enriched.get("keywords"),
+                })
+            else:
+                missed_papers.append({
+                    "title": ms.title,
+                    "doi": ms.doi,
+                    "pmid": ms.pmid,
+                })
 
         # Evaluate human strategy (default, skip with --no-human)
         human_metrics = None
@@ -611,6 +992,9 @@ def run_study(
         llm_queries=generated_queries,
         merged_query=merged_query,
         human_query=human_query,
+        query_prompt=query_prompt,
+        missed_papers=missed_papers,
+        citation_stats=citation_stats,
     )
 
 
@@ -631,6 +1015,8 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     lines.append(f"- **Model**: {MODEL}")
     lines.append(f"- **N runs**: {args.n}")
     lines.append(f"- **Double prompt**: {args.double_prompt}")
+    lines.append(f"- **Seed papers**: {args.seeds}")
+    lines.append(f"- **Citations**: {args.citations}")
     lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
     lines.append(f"")
 
@@ -654,6 +1040,10 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
         nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
         h_nnr_str = f"{h.nnr:.1f}" if h and h.nnr != float("inf") else "—"
         lines.append(f"| NNR | {nnr_str} | {h_nnr_str} |")
+        if r.citation_stats:
+            cs = r.citation_stats
+            lines.append(f"| **Citation PMIDs** | {cs['total']} total, {cs['new']} new | — |")
+            lines.append(f"| **Citation included** | {cs['hits_total']} found ({cs['hits']} new, {cs['hits_already_in_query']} already in query) | — |")
         lines.append(f"")
 
     # Summary table if multiple studies
@@ -743,6 +1133,47 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             lines.append(f"```")
             lines.append(f"")
 
+    if args.show_missed:
+        lines.append(f"## Missed Papers (PubMed-indexed only)")
+        lines.append(f"")
+        for r in results:
+            if r.missed_papers:
+                lines.append(f"### Study {r.study_id} - {r.study_name}")
+                lines.append(f"")
+                for i, p in enumerate(r.missed_papers, 1):
+                    title = p.get("title") or "—"
+                    pmid = p.get("pmid") or "—"
+                    doi = p.get("doi") or "—"
+                    lines.append(f"**{i}. {title}**")
+                    lines.append(f"- PMID: {pmid} | DOI: {doi}")
+                    if p.get("mesh_terms"):
+                        lines.append(f"- MeSH: {', '.join(p['mesh_terms'])}")
+                    if p.get("keywords"):
+                        lines.append(f"- Keywords: {', '.join(p['keywords'])}")
+                    if p.get("abstract"):
+                        abstract = p["abstract"]
+                        if len(abstract) > 500:
+                            abstract = abstract[:500] + "..."
+                        lines.append(f"- Abstract: {abstract}")
+                    lines.append(f"")
+            elif r.missed_papers is not None:
+                lines.append(f"### Study {r.study_id} - {r.study_name}")
+                lines.append(f"")
+                lines.append(f"No PubMed-indexed papers were missed.")
+                lines.append(f"")
+
+    if args.save_prompt:
+        lines.append(f"## Prompts")
+        lines.append(f"")
+        for r in results:
+            if r.query_prompt:
+                lines.append(f"### Study {r.study_id} - {r.study_name}")
+                lines.append(f"")
+                lines.append(f"```")
+                lines.append(r.query_prompt)
+                lines.append(f"```")
+                lines.append(f"")
+
     filepath.write_text("\n".join(lines))
     return filepath
 
@@ -772,6 +1203,52 @@ def main():
         "--double-prompt",
         action="store_true",
         help="Repeat the query generation prompt twice in a single message for emphasis",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=0,
+        help="Number of random seed papers to include in the prompt (0 = disabled)",
+    )
+    parser.add_argument(
+        "--seed-fields",
+        type=str,
+        default="tamk",
+        help="Which seed paper fields to include: t=title, a=abstract, m=MeSH, k=keywords (default: tamk = all)",
+    )
+    parser.add_argument(
+        "--save-prompt",
+        action="store_true",
+        help="Include the full LLM prompt in the results markdown file",
+    )
+    parser.add_argument(
+        "--show-missed",
+        action="store_true",
+        help="Include a list of missed (not captured) papers in the results file",
+    )
+    parser.add_argument(
+        "--citations",
+        action="store_true",
+        help="Augment query results with forward/backward citations of seed papers via OpenAlex (requires --seeds)",
+    )
+    parser.add_argument(
+        "--citation-depth",
+        type=int,
+        default=1,
+        help="Citation expansion depth (1 = direct citations only)",
+    )
+    parser.add_argument(
+        "--citation-direction",
+        type=str,
+        choices=["both", "forward", "backward"],
+        default="both",
+        help="Citation direction to follow (default: both)",
+    )
+    parser.add_argument(
+        "--citation-max-frontier",
+        type=int,
+        default=0,
+        help="Cap number of works expanded at each depth (0 = no cap)",
     )
     args = parser.parse_args()
 
