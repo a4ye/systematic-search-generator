@@ -23,6 +23,7 @@ from src.compare_search import IncludedStudy, extract_included_studies
 from src.discovery.study_finder import StudyFinder
 from src.evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check, match_studies
 from src.llm.openai_client import OpenAIClient
+from src.mesh import MeshDB
 from src.pipeline.config import PipelineConfig
 from src.pubmed.search_executor import PubMedExecutor, PubMedSearchResults
 
@@ -341,6 +342,66 @@ def get_missed_seed_papers(
     return missed, unchecked
 
 
+_MESH_TERM_RE = re.compile(r"\"([^\"]+)\"\\[(?:MeSH|Mesh)\\]")
+
+
+def _format_tiab(term: str) -> str:
+    term = " ".join(term.strip().split())
+    if not term:
+        return ""
+    if "*" in term:
+        return f"{term}[tiab]"
+    if " " in term:
+        return f"\"{term}\"[tiab]"
+    return f"{term}[tiab]"
+
+
+def expand_mesh_entry_terms(
+    query: str,
+    mesh_db: MeshDB,
+    max_terms: int,
+) -> tuple[str, dict]:
+    """Expand MeSH terms with entry-term free-text variants."""
+    lower_query = query.lower()
+    added_lower: set[str] = set()
+    cache: dict[str, str] = {}
+    mesh_found = 0
+    mesh_expanded = 0
+    entry_added = 0
+
+    def repl(match: re.Match) -> str:
+        nonlocal mesh_found, mesh_expanded, entry_added
+        mesh_found += 1
+        term = match.group(1)
+        if term in cache:
+            return cache[term]
+        entry_terms = mesh_db.entry_terms(term, max_terms=max_terms)
+        additions: list[str] = []
+        for entry in entry_terms:
+            tiab = _format_tiab(entry)
+            tiab_lower = tiab.lower() if tiab else ""
+            if tiab and tiab_lower not in lower_query and tiab_lower not in added_lower:
+                additions.append(tiab)
+                added_lower.add(tiab_lower)
+        if not additions:
+            cache[term] = match.group(0)
+            return match.group(0)
+        mesh_expanded += 1
+        entry_added += len(additions)
+        replacement = "(" + match.group(0) + " OR " + " OR ".join(additions) + ")"
+        cache[term] = replacement
+        return replacement
+
+    expanded = _MESH_TERM_RE.sub(repl, query)
+    stats = {
+        "mesh_terms_found": mesh_found,
+        "mesh_terms_expanded": mesh_expanded,
+        "entry_terms_added": entry_added,
+        "mesh_year": mesh_db.loaded_year(),
+    }
+    return expanded, stats
+
+
 # ── End configuration ────────────────────────────────────────────────────────
 
 
@@ -354,6 +415,7 @@ class StudyResult:
     human_metrics: object | None  # MetricsResult or None
     llm_queries: list[str] | None = None
     merged_query: str | None = None
+    executed_query: str | None = None
     human_query: str | None = None
     query_prompt: str | None = None
     missed_papers: list[dict] | None = None
@@ -361,6 +423,7 @@ class StudyResult:
     supplement_query: str | None = None
     supplement_stats: dict | None = None
     similar_stats: dict | None = None
+    mesh_entry_stats: dict | None = None
     error: str | None = None
 
 
@@ -801,7 +864,23 @@ def run_study(
                 return None
 
             progress.update(task_id, description=f"{label}: fetching {result_count:,} results...")
-            search_results = pubmed.execute_query_fast(query, max_results=config.max_pubmed_results)
+            batch_task_id = None
+
+            def _batch_progress(done: int, total: int) -> None:
+                nonlocal batch_task_id
+                if total <= 0:
+                    return
+                if batch_task_id is None:
+                    batch_task_id = progress.add_task(f"{label}: batches", total=total)
+                progress.update(batch_task_id, completed=done)
+
+            search_results = pubmed.execute_query_fast(
+                query,
+                max_results=config.max_pubmed_results,
+                progress_callback=_batch_progress,
+            )
+            if batch_task_id is not None:
+                progress.remove_task(batch_task_id)
             step(f"{label}: fetched {result_count:,}")
 
             pmids = list(search_results.pmid_map.keys())
@@ -818,6 +897,28 @@ def run_study(
         else:
             final_query = unique_queries[0]
             merged_query = None
+
+        mesh_entry_stats = None
+        if args.mesh_entry_terms:
+            try:
+                mesh_db = MeshDB(config.cache_dir)
+                expanded_query, stats = expand_mesh_entry_terms(
+                    final_query,
+                    mesh_db,
+                    max_terms=args.mesh_entry_max,
+                )
+                mesh_entry_stats = stats
+                if stats["entry_terms_added"] > 0:
+                    final_query = expanded_query
+                    log.print(
+                        f"[dim]  MeSH entry terms: +{stats['entry_terms_added']} "
+                        f"across {stats['mesh_terms_expanded']}/{stats['mesh_terms_found']} "
+                        f"MeSH terms[/dim]"
+                    )
+                else:
+                    log.print("[dim]  MeSH entry terms: no additions[/dim]")
+            except Exception as exc:
+                log.print(f"[yellow]MeSH entry-term expansion failed: {exc}[/yellow]")
 
         # Execute the single (possibly merged) query against PubMed
         llm_results = fetch_or_cached(final_query, "LLM query")
@@ -1355,6 +1456,7 @@ def run_study(
         human_metrics=human_metrics,
         llm_queries=generated_queries,
         merged_query=merged_query,
+        executed_query=final_query,
         human_query=human_query,
         query_prompt=query_prompt,
         missed_papers=missed_papers,
@@ -1362,6 +1464,7 @@ def run_study(
         supplement_query=supplement_query,
         supplement_stats=supplement_stats,
         similar_stats=similar_stats,
+        mesh_entry_stats=mesh_entry_stats,
     )
 
 
@@ -1393,6 +1496,9 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     lines.append(f"- **Two-pass supplement**: {args.two_pass}")
     if args.two_pass:
         lines.append(f"- **Two-pass max**: {args.two_pass_max}")
+    lines.append(f"- **MeSH entry-term expansion**: {args.mesh_entry_terms}")
+    if args.mesh_entry_terms:
+        lines.append(f"- **MeSH entry-term max**: {args.mesh_entry_max}")
     lines.append(f"- **Similar articles per seed**: {args.similar}")
     lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
     lines.append(f"")
@@ -1436,6 +1542,16 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                 f"{cs.get('seed_not_found_openalex', 0)} not in OpenAlex | — |"
             )
         lines.append(f"")
+        if r.mesh_entry_stats and r.mesh_entry_stats.get("entry_terms_added", 0) > 0:
+            ms = r.mesh_entry_stats
+            lines.append("**MeSH entry-term expansion**")
+            lines.append(
+                f"- Added {ms.get('entry_terms_added', 0)} terms across "
+                f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
+            )
+            if ms.get("mesh_year"):
+                lines.append(f"- MeSH year: {ms.get('mesh_year')}")
+            lines.append(f"")
         if r.supplement_stats:
             ss = r.supplement_stats
             lines.append("**Supplement pass**")
@@ -1565,6 +1681,12 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             lines.append(r.merged_query)
             lines.append(f"```")
             lines.append(f"")
+        if r.executed_query:
+            lines.append(f"**Executed Query:**")
+            lines.append(f"```")
+            lines.append(r.executed_query)
+            lines.append(f"```")
+            lines.append(f"")
         if r.human_query:
             lines.append(f"**Human Query:**")
             lines.append(f"```")
@@ -1680,6 +1802,17 @@ def main():
         type=int,
         default=3,
         help="Maximum number of supplementary passes to run (default: 3)",
+    )
+    parser.add_argument(
+        "--mesh-entry-terms",
+        action="store_true",
+        help="Expand MeSH terms with entry-term free-text variants",
+    )
+    parser.add_argument(
+        "--mesh-entry-max",
+        type=int,
+        default=6,
+        help="Maximum number of entry terms per MeSH heading (default: 6)",
     )
     parser.add_argument(
         "--similar",

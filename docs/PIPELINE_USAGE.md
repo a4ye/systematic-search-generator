@@ -137,6 +137,8 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 | `--citation-max-frontier N` | Cap number of works expanded at each depth (0 = no cap). |
 | `--two-pass` | Generate a supplementary query for missed seed papers and merge results. |
 | `--two-pass-max N` | Maximum number of supplementary passes to run (default: 3). |
+| `--mesh-entry-terms` | Expand MeSH terms with entry-term free-text variants. |
+| `--mesh-entry-max N` | Maximum number of entry terms per MeSH heading (default: 6). |
 | `--similar N` | Fetch up to N PubMed "Similar Articles" per seed paper and merge results (0 = disabled). |
 | `--show-missed` | Append a "Missed Papers" section to the results file listing PubMed-indexed papers not captured by the query, with title, abstract, MeSH terms, and keywords (enriched from `seed_papers/` cache). |
 | `--save-prompt` | Append the full composed LLM prompt to the results file. |

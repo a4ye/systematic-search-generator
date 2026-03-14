@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from http.client import IncompleteRead, RemoteDisconnected
+import math
 from typing import Any
 from urllib.error import HTTPError, URLError
 
@@ -223,6 +224,7 @@ class PubMedExecutor:
         self,
         query: str,
         max_results: int = 10000,
+        progress_callback=None,
     ) -> PubMedSearchResults:
         """Execute query and return results using lightweight esummary.
 
@@ -256,6 +258,9 @@ class PubMedExecutor:
 
         # Use esummary to get DOIs (much lighter than full MEDLINE)
         pmid_to_doi: dict[str, str] = {}
+        total_batches = math.ceil(len(id_list) / self.batch_size) if self.batch_size else 0
+        if progress_callback and total_batches:
+            progress_callback(0, total_batches)
 
         def _fetch_summaries(start, batch_size, webenv, query_key):
             """Fetch and parse summaries in one retryable unit."""
@@ -272,6 +277,7 @@ class PubMedExecutor:
                 handle.close()
             return summaries
 
+        completed_batches = 0
         for start in range(0, len(id_list), self.batch_size):
             time.sleep(self.rate_limit_delay)
 
@@ -297,6 +303,9 @@ class PubMedExecutor:
                             doi = eloc[4:].strip()
                     if pmid and doi:
                         pmid_to_doi[pmid] = doi.lower()
+            completed_batches += 1
+            if progress_callback and total_batches:
+                progress_callback(completed_batches, total_batches)
 
         execution_time = time.time() - start_time
 
