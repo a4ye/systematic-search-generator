@@ -2,17 +2,19 @@
 
 import argparse
 import json
+import math
 import random
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from Bio import Entrez, Medline
@@ -116,8 +118,8 @@ Important:
 - If a field is not present in the document, write "Not specified".
 """
 
-
 SEED_PAPERS_DIR = Path("seed_papers")
+SPLASH_FILE = Path("splash_messages.txt")
 
 
 def load_seed_papers(study_id: str, study_name: str, n: int) -> list[dict] | None:
@@ -185,6 +187,27 @@ def format_seed_papers(papers: list[dict], fields: str = "tamk") -> str:
     return "\n".join(lines)
 
 
+def load_splash_text() -> str:
+    """Load a random splash message from the splash text file."""
+    try:
+        lines = [l.strip() for l in SPLASH_FILE.read_text().splitlines()]
+        choices = [l for l in lines if l and not l.startswith("#")]
+        if choices:
+            return random.choice(choices)
+    except Exception:
+        pass
+    return "Crunching citations..."
+
+
+def load_splash_messages() -> list[str]:
+    """Load all splash messages from file."""
+    try:
+        lines = [l.strip() for l in SPLASH_FILE.read_text().splitlines()]
+        return [l for l in lines if l and not l.startswith("#")]
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Citation DOI enrichment helpers
 # ---------------------------------------------------------------------------
@@ -210,11 +233,11 @@ def _extract_dois_from_medline_record(record: dict) -> list[str]:
 
 
 def fetch_dois_for_pmids(
-    pmids: list[str],
-    email: str,
-    api_key: str | None,
-    rate_delay: float,
-    batch_size: int = 200,
+        pmids: list[str],
+        email: str,
+        api_key: str | None,
+        rate_delay: float,
+        batch_size: int = 200,
 ) -> dict[str, list[str]]:
     """Fetch DOI mappings for PMIDs via Entrez MEDLINE."""
     if not pmids:
@@ -251,11 +274,11 @@ def fetch_dois_for_pmids(
 
 
 def fetch_similar_pmids(
-    seed_pmids: list[str],
-    email: str,
-    api_key: str | None,
-    rate_delay: float,
-    per_seed: int,
+        seed_pmids: list[str],
+        email: str,
+        api_key: str | None,
+        rate_delay: float,
+        per_seed: int,
 ) -> dict[str, list[str]]:
     """Fetch similar articles from PubMed for each seed PMID."""
     if not seed_pmids or per_seed <= 0:
@@ -299,8 +322,8 @@ def fetch_similar_pmids(
 
 
 def count_found_studies(
-    search_results: PubMedSearchResults,
-    included_studies: list[IncludedStudy],
+        search_results: PubMedSearchResults,
+        included_studies: list[IncludedStudy],
 ) -> int:
     """Count how many included studies match the search results."""
     found = 0
@@ -316,8 +339,8 @@ def count_found_studies(
 
 
 def get_missed_seed_papers(
-    seed_papers: list[dict],
-    search_results: PubMedSearchResults,
+        seed_papers: list[dict],
+        search_results: PubMedSearchResults,
 ) -> tuple[list[dict], int]:
     """Return seed papers missed by the search results and count unchecked seeds."""
     missed: list[dict] = []
@@ -342,7 +365,41 @@ def get_missed_seed_papers(
     return missed, unchecked
 
 
-_MESH_TERM_RE = re.compile(r"\"([^\"]+)\"\\[(?:MeSH|Mesh)\\]")
+def merge_seed_papers_into_included(
+        included_studies: list[IncludedStudy],
+        seed_papers: list[dict] | None,
+) -> tuple[list[IncludedStudy], int]:
+    """Merge seed papers into included studies for evaluation."""
+    if not seed_papers:
+        return included_studies, 0
+    existing_pmids = {s.pmid for s in included_studies if s.pmid}
+    existing_dois = {s.doi for s in included_studies if s.doi}
+    merged = list(included_studies)
+    added = 0
+    for sp in seed_papers:
+        pmid = sp.get("pmid")
+        doi = sp.get("doi")
+        if pmid:
+            pmid = str(pmid).strip()
+        if doi:
+            doi = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
+        if not pmid and not doi:
+            continue
+        if pmid and pmid in existing_pmids:
+            continue
+        if doi and doi in existing_dois:
+            continue
+        merged.append(IncludedStudy(doi=doi, pmid=pmid, title=sp.get("title")))
+        if pmid:
+            existing_pmids.add(pmid)
+        if doi:
+            existing_dois.add(doi)
+        added += 1
+    return merged, added
+
+
+_MESH_TERM_RE = re.compile(r"\"([^\"]+)\"\[(?:MeSH|Mesh)\]")
+_MESH_TERM_UNQUOTED_RE = re.compile(r"\b([^\s\)\(]+?)\[(?:MeSH|Mesh)\]")
 
 
 def _format_tiab(term: str) -> str:
@@ -356,10 +413,21 @@ def _format_tiab(term: str) -> str:
     return f"{term}[tiab]"
 
 
+def _format_ti(term: str) -> str:
+    term = " ".join(term.strip().split())
+    if not term:
+        return ""
+    if "*" in term:
+        return f"{term}[ti]"
+    if " " in term:
+        return f"\"{term}\"[ti]"
+    return f"{term}[ti]"
+
+
 def expand_mesh_entry_terms(
-    query: str,
-    mesh_db: MeshDB,
-    max_terms: int,
+        query: str,
+        mesh_db: MeshDB,
+        max_terms: int,
 ) -> tuple[str, dict]:
     """Expand MeSH terms with entry-term free-text variants."""
     lower_query = query.lower()
@@ -368,11 +436,17 @@ def expand_mesh_entry_terms(
     mesh_found = 0
     mesh_expanded = 0
     entry_added = 0
+    detected_terms: list[str] = []
+    debug_samples: list[tuple[str, int]] = []
+
+    def _normalize_mesh_term(term: str) -> str:
+        return term.strip().strip(",")
 
     def repl(match: re.Match) -> str:
         nonlocal mesh_found, mesh_expanded, entry_added
         mesh_found += 1
-        term = match.group(1)
+        term = _normalize_mesh_term(match.group(1))
+        detected_terms.append(term)
         if term in cache:
             return cache[term]
         entry_terms = mesh_db.entry_terms(term, max_terms=max_terms)
@@ -388,18 +462,144 @@ def expand_mesh_entry_terms(
             return match.group(0)
         mesh_expanded += 1
         entry_added += len(additions)
+        debug_samples.append((term, len(additions)))
         replacement = "(" + match.group(0) + " OR " + " OR ".join(additions) + ")"
         cache[term] = replacement
         return replacement
 
     expanded = _MESH_TERM_RE.sub(repl, query)
+    expanded = _MESH_TERM_UNQUOTED_RE.sub(repl, expanded)
     stats = {
         "mesh_terms_found": mesh_found,
         "mesh_terms_expanded": mesh_expanded,
         "entry_terms_added": entry_added,
+        "mesh_terms_detected": detected_terms,
+        "mesh_terms_samples": debug_samples[:5],
         "mesh_year": mesh_db.loaded_year(),
     }
     return expanded, stats
+
+
+# ── TF-IDF term mining (seed papers) ────────────────────────────────────────
+
+_TFIDF_MIN_TOKEN_LEN = 3
+_TFIDF_MAX_DOC_FRACTION = 0.8
+_TFIDF_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+    "for", "from", "in", "into", "is", "it", "its", "of", "on", "or",
+    "that", "the", "their", "they", "this", "those", "to", "was", "were",
+    "with", "within", "without", "over", "under", "between", "among",
+    "before", "after", "during", "per", "via", "vs", "versus",
+    "we", "our", "ours", "you", "your", "i", "me", "my",
+    "et", "al",
+    "study", "studies", "trial", "trials", "randomized", "randomised",
+    "randomization", "randomisation", "patient", "patients", "participant",
+    "participants", "subject", "subjects", "cohort", "cohorts",
+    "group", "groups", "case", "cases", "control", "controls",
+    "analysis", "analyses", "result", "results", "outcome", "outcomes",
+    "effect", "effects", "risk", "risks", "association", "associated",
+    "associations", "evidence", "data", "method", "methods",
+    "clinical", "systematic", "review", "reviews", "meta", "protocol",
+    "disease", "disorder", "disorders", "syndrome", "condition",
+    "treatment", "therapy", "management", "intervention",
+    "baseline", "follow", "followup", "follow-up", "significant",
+    "significance", "including", "include", "includes", "based",
+}
+
+
+def _tokenize_tfidf(text: str) -> list[str]:
+    if not text:
+        return []
+    cleaned = text.lower()
+    cleaned = re.sub(r"[-_/]", " ", cleaned)
+    cleaned = re.sub(r"[^a-z\s]", " ", cleaned)
+    tokens: list[str] = []
+    for token in cleaned.split():
+        if len(token) < _TFIDF_MIN_TOKEN_LEN:
+            continue
+        if token in _TFIDF_STOPWORDS:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def extract_tfidf_terms(
+        papers: list[dict],
+        max_terms: int,
+) -> tuple[list[str], dict]:
+    """Extract TF-IDF ranked terms from seed papers (title + abstract)."""
+    docs: list[list[str]] = []
+    skipped = 0
+    for paper in papers:
+        parts = [paper.get("title") or "", paper.get("abstract") or ""]
+        text = " ".join(p for p in parts if p)
+        tokens = _tokenize_tfidf(text)
+        if tokens:
+            docs.append(tokens)
+        else:
+            skipped += 1
+
+    if not docs:
+        return [], {"docs_used": 0, "docs_skipped": skipped, "terms_scored": 0}
+
+    doc_counts: list[tuple[Counter, int]] = []
+    df: Counter = Counter()
+    for tokens in docs:
+        counts = Counter(tokens)
+        doc_counts.append((counts, len(tokens)))
+        df.update(counts.keys())
+
+    n_docs = len(docs)
+    max_doc_fraction = _TFIDF_MAX_DOC_FRACTION if n_docs >= 3 else 1.0
+    scores: dict[str, float] = {}
+    for term, doc_freq in df.items():
+        if doc_freq / n_docs > max_doc_fraction:
+            continue
+        idf = math.log((n_docs + 1) / (doc_freq + 1)) + 1.0
+        score = 0.0
+        for counts, total in doc_counts:
+            if not total:
+                continue
+            tf = counts.get(term, 0) / total
+            if tf:
+                score += tf * idf
+        if score > 0:
+            scores[term] = score
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    terms = [term for term, _ in ranked[:max_terms]]
+    stats = {
+        "docs_used": n_docs,
+        "docs_skipped": skipped,
+        "terms_scored": len(scores),
+        "max_doc_fraction": max_doc_fraction,
+    }
+    return terms, stats
+
+
+def filter_tfidf_terms(terms: list[str], query: str) -> list[str]:
+    if not query:
+        return terms
+    query_lower = query.lower()
+    filtered: list[str] = []
+    for term in terms:
+        if not term:
+            continue
+        if re.search(rf"\\b{re.escape(term)}\\b", query_lower):
+            continue
+        filtered.append(term)
+    return filtered
+
+
+def build_tfidf_query(terms: list[str], field: str = "tiab") -> str:
+    if field == "ti":
+        formatter = _format_ti
+    else:
+        formatter = _format_tiab
+    formatted = [formatter(t) for t in terms if formatter(t)]
+    if not formatted:
+        return ""
+    return "(" + " OR ".join(formatted) + ")"
 
 
 # ── End configuration ────────────────────────────────────────────────────────
@@ -424,15 +624,18 @@ class StudyResult:
     supplement_stats: dict | None = None
     similar_stats: dict | None = None
     mesh_entry_stats: dict | None = None
+    tfidf_query: str | None = None
+    tfidf_stats: dict | None = None
     error: str | None = None
 
 
 def _calculate_total_steps(
-    n_runs: int,
-    include_human: bool,
-    two_pass: bool,
-    similar: bool,
-    two_pass_max: int,
+        n_runs: int,
+        include_human: bool,
+        two_pass: bool,
+        similar: bool,
+        tfidf: bool,
+        two_pass_max: int,
 ) -> int:
     """Calculate the total number of progress steps for a study pipeline.
 
@@ -449,6 +652,8 @@ def _calculate_total_steps(
         total += 2 * max(1, two_pass_max)  # supplement LLM + supplement fetch (max passes)
     if similar:
         total += 1  # similar articles fetch
+    if tfidf:
+        total += 1  # TF-IDF supplemental query
     if include_human:
         total += 3  # strategy extract + fetch + evaluate
     return total
@@ -483,11 +688,11 @@ def extract_query_from_response(text: str) -> str:
 
 
 def print_study_table(
-    console: Console,
-    llm_metrics: EvaluationMetrics,
-    human_metrics: EvaluationMetrics | None,
-    allow_float_counts: bool = False,
-    title: str | None = None,
+        console: Console,
+        llm_metrics: EvaluationMetrics,
+        human_metrics: EvaluationMetrics | None,
+        allow_float_counts: bool = False,
+        title: str | None = None,
 ):
     """Print the comparison table."""
     m = llm_metrics
@@ -707,15 +912,15 @@ def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
 
 
 def run_study(
-    study_id_arg: str,
-    args: argparse.Namespace,
-    config: PipelineConfig,
-    finder: StudyFinder,
-    client: OpenAIClient,
-    pubmed: PubMedExecutor,
-    index_cache: PubMedIndexCache,
-    query_cache: QueryResultsCache,
-    console: Console,
+        study_id_arg: str,
+        args: argparse.Namespace,
+        config: PipelineConfig,
+        finder: StudyFinder,
+        client: OpenAIClient,
+        pubmed: PubMedExecutor,
+        index_cache: PubMedIndexCache,
+        query_cache: QueryResultsCache,
+        console: Console,
 ) -> StudyResult | None:
     """Run the full pipeline for a single study. Returns StudyResult or None on skip."""
     rate_delay = 0.1 if config.entrez_api_key else 0.34
@@ -753,26 +958,61 @@ def run_study(
         include_human,
         args.two_pass,
         args.similar > 0,
+        args.tfidf,
         args.two_pass_max,
     )
+
+    splash_messages = load_splash_messages()
+    if not splash_messages:
+        splash_messages = [load_splash_text()]
+    splash_colors = ["bright_magenta", "bright_cyan", "bright_green", "bright_yellow", "bright_blue"]
+    last_splash_change = time.time()
+    splash_interval = random.uniform(5, 10)
+    splash_index = 0
+    color_index = 0
+
+    def _shimmer_text(text: str, offset: int = 0) -> str:
+        if not text:
+            return text
+        parts = []
+        for i, ch in enumerate(text):
+            color = splash_colors[(i + offset) % len(splash_colors)]
+            parts.append(f"[bold {color}]{ch}[/]")
+        return "".join(parts)
+
+    def maybe_rotate_splash() -> str:
+        nonlocal last_splash_change, splash_interval, splash_index, color_index
+        now = time.time()
+        if now - last_splash_change >= splash_interval:
+            last_splash_change = now
+            splash_interval = random.uniform(5, 10)
+            splash_index = (splash_index + 1) % len(splash_messages)
+        msg = splash_messages[splash_index]
+        color_index = (color_index + 1) % len(splash_colors)
+        return _shimmer_text(msg, color_index)
 
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
+        TextColumn("[dim]{task.fields[splash]}[/dim]"),
+        BarColumn(bar_width=25),
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
-        TimeRemainingColumn(),
         console=console,
         transient=True,
+        expand=False,
     )
 
     with progress:
-        task_id = progress.add_task("Loading included studies...", total=total_steps)
+        task_id = progress.add_task(
+            "Loading included studies...",
+            total=total_steps,
+            splash=maybe_rotate_splash(),
+        )
         log = progress.console
-
+        progress.refresh()
         def step(description: str) -> None:
-            progress.update(task_id, description=description, advance=1)
+            progress.update(task_id, description=description, advance=1, splash=maybe_rotate_splash())
 
         # Load included studies
         included_result = extract_included_studies(str(study.included_studies_xlsx))
@@ -785,7 +1025,7 @@ def run_study(
         log.print(f"Included studies: {len(included_studies)}")
 
         # Step 1: Extract plan from PROSPERO PDF
-        progress.update(task_id, description=f"Extracting plan with {MODEL}...")
+        progress.update(task_id, description=f"Extracting plan with {MODEL}...", splash=maybe_rotate_splash())
         extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
         step("Extracted plan")
         plan_info = extract_response.content
@@ -798,7 +1038,7 @@ def run_study(
         seed_section = ""
         seed_papers = None
         if args.seeds > 0:
-            progress.update(task_id, description="Loading seed papers...")
+            progress.update(task_id, description="Loading seed papers...", splash=maybe_rotate_splash())
             seed_papers = load_seed_papers(study.study_id, study.name, args.seeds)
             if seed_papers:
                 seed_section = "\n\n" + format_seed_papers(seed_papers, fields=args.seed_fields)
@@ -806,6 +1046,15 @@ def run_study(
                 log.print(f"[dim]  Loaded {len(seed_papers)} seed papers ({', '.join(field_names)})[/dim]")
             else:
                 log.print("[yellow]  No valid seed papers found for this study[/yellow]")
+
+        eval_included_studies, added_seeds = merge_seed_papers_into_included(
+            included_studies,
+            seed_papers,
+        )
+        if added_seeds:
+            log.print(f"[dim]  Added {added_seeds} seed paper(s) to evaluation set[/dim]")
+        if eval_included_studies is not included_studies:
+            log.print(f"[dim]  Included studies (with seeds): {len(eval_included_studies)}[/dim]")
 
         # Step 3: Generate query from extracted plan
         query_prompt = QUERY_PROMPT + "\n" + plan_info + seed_section
@@ -824,7 +1073,7 @@ def run_study(
             return run_i, q, resp.prompt_tokens, resp.completion_tokens, resp.generation_time
 
         if n_runs == 1:
-            progress.update(task_id, description="Generating query...")
+            progress.update(task_id, description="Generating query...", splash=maybe_rotate_splash())
             _, q, pt, ct, gt = _generate_one(0)
             step("Generated query")
             generated_queries = [q]
@@ -844,9 +1093,21 @@ def run_study(
                         f"[dim]  Run {run_i + 1}/{n_runs} done — {pt} in / {ct} out, {gt:.1f}s[/dim]"
                     )
 
-        def fetch_or_cached(query: str, label: str) -> PubMedSearchResults | None:
+        def fetch_or_cached(
+                query: str,
+                label: str,
+                max_count: int = 50000,
+                known_count: int | None = None,
+        ) -> PubMedSearchResults | None:
             cached_result = query_cache.get(query)
             if cached_result:
+                if cached_result.result_count > max_count:
+                    log.print(
+                        f"[red]{label} too broad (cached): {cached_result.result_count:,} results "
+                        f"(max {max_count:,})[/red]"
+                    )
+                    step(f"{label}: too broad")
+                    return None
                 log.print(f"[dim]{label}: using cached PubMed results[/dim]")
                 step(f"{label}: cached")
                 return PubMedSearchResults.from_cached(
@@ -856,14 +1117,22 @@ def run_study(
                     doi_to_pmid=cached_result.doi_to_pmid,
                 )
 
-            progress.update(task_id, description=f"{label}: counting results...")
-            result_count = pubmed.count_results(query)
-            if result_count > 50000:
-                log.print(f"[red]Query too broad: {result_count:,} results (max 50,000)[/red]")
+            if known_count is None:
+                progress.update(
+                    task_id,
+                    description=f"{label}: counting results...",
+                    splash=maybe_rotate_splash(),
+                )
+            result_count = known_count if known_count is not None else pubmed.count_results(query)
+            if result_count > max_count:
+                log.print(
+                    f"[red]{label} too broad: {result_count:,} results (max {max_count:,})[/red]"
+                )
                 step(f"{label}: too broad")
                 return None
 
-            progress.update(task_id, description=f"{label}: fetching {result_count:,} results...")
+            progress.update(task_id, description=f"{label}: fetching {result_count:,} results...",
+                            splash=maybe_rotate_splash())
             batch_task_id = None
 
             def _batch_progress(done: int, total: int) -> None:
@@ -871,8 +1140,12 @@ def run_study(
                 if total <= 0:
                     return
                 if batch_task_id is None:
-                    batch_task_id = progress.add_task(f"{label}: batches", total=total)
-                progress.update(batch_task_id, completed=done)
+                    batch_task_id = progress.add_task(
+                        f"{label}: batches",
+                        total=total,
+                        splash=maybe_rotate_splash(),
+                    )
+                progress.update(batch_task_id, completed=done, splash=maybe_rotate_splash())
 
             search_results = pubmed.execute_query_fast(
                 query,
@@ -916,9 +1189,37 @@ def run_study(
                         f"MeSH terms[/dim]"
                     )
                 else:
-                    log.print("[dim]  MeSH entry terms: no additions[/dim]")
+                    detected = stats.get("mesh_terms_detected", [])
+                    log.print(
+                        f"[dim]  MeSH entry terms: no additions "
+                        f"(detected {len(detected)} headings)[/dim]"
+                    )
+                if stats.get("mesh_terms_samples"):
+                    samples = ", ".join(f"{t} (+{n})" for t, n in stats["mesh_terms_samples"])
+                    log.print(f"[dim]  MeSH samples: {samples}[/dim]")
             except Exception as exc:
                 log.print(f"[yellow]MeSH entry-term expansion failed: {exc}[/yellow]")
+
+        tfidf_terms: list[str] = []
+        tfidf_term_stats: dict | None = None
+        tfidf_skip_reason: str | None = None
+        if args.tfidf:
+            if not seed_papers:
+                tfidf_skip_reason = "no_seed_papers"
+            else:
+                raw_terms, term_stats = extract_tfidf_terms(
+                    seed_papers,
+                    max_terms=max(1, args.tfidf_top * 3),
+                )
+                filtered_terms = filter_tfidf_terms(raw_terms, final_query)
+                tfidf_terms = filtered_terms[: max(1, args.tfidf_top)]
+                tfidf_term_stats = term_stats
+                if tfidf_terms:
+                    sample = ", ".join(tfidf_terms[:5])
+                    suffix = "..." if len(tfidf_terms) > 5 else ""
+                    log.print(f"[dim]  TF-IDF terms: {len(tfidf_terms)} ({sample}{suffix})[/dim]")
+                else:
+                    tfidf_skip_reason = "no_terms"
 
         # Execute the single (possibly merged) query against PubMed
         llm_results = fetch_or_cached(final_query, "LLM query")
@@ -959,14 +1260,18 @@ def run_study(
                         fields=args.seed_fields,
                     )
                     supplement_prompt = (
-                        SUPPLEMENT_PROMPT
-                        + "\n\nOriginal query:\n"
-                        + final_query
-                        + "\n\n"
-                        + plan_info
-                        + supplement_seed_section
+                            SUPPLEMENT_PROMPT
+                            + "\n\nOriginal query:\n"
+                            + final_query
+                            + "\n\n"
+                            + plan_info
+                            + supplement_seed_section
                     )
-                    progress.update(task_id, description=f"Generating supplement query {passes_run}...")
+                    progress.update(
+                        task_id,
+                        description=f"Generating supplement query {passes_run}...",
+                        splash=maybe_rotate_splash(),
+                    )
                     resp = client.generate_text(prompt=supplement_prompt)
                     supplement_query = extract_query_from_response(resp.content)
                     step(f"Generated supplement query {passes_run}")
@@ -998,7 +1303,7 @@ def run_study(
 
                     before_pmids = set(llm_results.pmid_map.keys())
                     before_dois = set(llm_results.doi_map.keys())
-                    found_before = count_found_studies(llm_results, included_studies)
+                    found_before = count_found_studies(llm_results, eval_included_studies)
                     supplement_pmids = set(supplement_results.pmid_map.keys())
                     new_pmids = supplement_pmids - before_pmids
                     dup_pmids = supplement_pmids & before_pmids
@@ -1012,9 +1317,9 @@ def run_study(
 
                     llm_results.result_count += len(new_pmids)
 
-                    found_after = count_found_studies(llm_results, included_studies)
+                    found_after = count_found_studies(llm_results, eval_included_studies)
                     delta_found = found_after - found_before
-                    total_included = len(included_studies)
+                    total_included = len(eval_included_studies)
                     recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
                     recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
 
@@ -1063,6 +1368,112 @@ def run_study(
                         "passes": [],
                     }
 
+        tfidf_query = None
+        tfidf_stats = None
+        if args.tfidf:
+            if tfidf_skip_reason == "no_seed_papers":
+                log.print("[yellow]TF-IDF enabled but no seed papers available; skipping[/yellow]")
+                progress.advance(task_id, 1)
+            elif tfidf_skip_reason == "no_terms":
+                log.print("[yellow]TF-IDF enabled but no usable terms found; skipping[/yellow]")
+                progress.advance(task_id, 1)
+            elif not tfidf_terms:
+                log.print("[yellow]TF-IDF enabled but no terms available; skipping[/yellow]")
+                progress.advance(task_id, 1)
+            else:
+                max_results = max(1, int(args.tfidf_max_results))
+                max_count = min(max_results, 50000)
+                attempt = min(len(tfidf_terms), max(1, args.tfidf_top))
+                selected_terms: list[str] | None = None
+                selected_count: int | None = None
+                selected_field: str = "tiab"
+
+                while attempt >= 1:
+                    candidate_terms = tfidf_terms[:attempt]
+                    last_count: int | None = None
+                    for field in ("tiab", "ti"):
+                        candidate_query = build_tfidf_query(candidate_terms, field=field)
+                        if not candidate_query:
+                            continue
+                        cached = query_cache.get(candidate_query)
+                        if cached:
+                            count = cached.result_count
+                        else:
+                            progress.update(
+                                task_id,
+                                description=f"TF-IDF query: counting results ({attempt} terms, {field})...",
+                                splash=maybe_rotate_splash(),
+                            )
+                            count = pubmed.count_results(candidate_query)
+                        last_count = count
+
+                        if count <= max_count:
+                            tfidf_query = candidate_query
+                            selected_terms = candidate_terms
+                            selected_count = count
+                            selected_field = field
+                            break
+                    if tfidf_query:
+                        break
+                    if last_count is None:
+                        break
+
+                    if attempt == 1:
+                        break
+                    if last_count > max_count * 5 and attempt > 2:
+                        attempt = max(1, attempt // 2)
+                    else:
+                        attempt -= 1
+
+                if not tfidf_query or not selected_terms:
+                    log.print(
+                        f"[yellow]TF-IDF query too broad (>{max_count:,} results); skipping[/yellow]"
+                    )
+                    progress.advance(task_id, 1)
+                else:
+                    if selected_field == "ti":
+                        log.print("[dim]  TF-IDF query: fell back to title-only terms[/dim]")
+                    tfidf_results = fetch_or_cached(
+                        tfidf_query,
+                        "TF-IDF query",
+                        max_count=max_count,
+                        known_count=selected_count,
+                    )
+                    if tfidf_results:
+                        before_pmids = set(llm_results.pmid_map.keys())
+                        before_dois = set(llm_results.doi_map.keys())
+                        tfidf_pmids = set(tfidf_results.pmid_map.keys())
+                        new_pmids = tfidf_pmids - before_pmids
+                        dup_pmids = tfidf_pmids & before_pmids
+
+                        for pmid, info in tfidf_results.pmid_map.items():
+                            if pmid not in llm_results.pmid_map:
+                                llm_results.pmid_map[pmid] = info
+                        for doi, info in tfidf_results.doi_map.items():
+                            if doi not in llm_results.doi_map:
+                                llm_results.doi_map[doi] = info
+
+                        llm_results.result_count += len(new_pmids)
+                        log.print(
+                            f"[dim]  TF-IDF query: {len(tfidf_pmids)} total PMIDs, "
+                            f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
+                        )
+
+                        tfidf_stats = {
+                            "docs_used": (tfidf_term_stats or {}).get("docs_used", 0),
+                            "docs_skipped": (tfidf_term_stats or {}).get("docs_skipped", 0),
+                            "terms_total": len(tfidf_terms),
+                            "terms_used": len(selected_terms),
+                            "terms": selected_terms,
+                            "field": selected_field,
+                            "max_results": max_count,
+                            "result_count": selected_count or len(tfidf_pmids),
+                            "total_pmids": len(tfidf_pmids),
+                            "new_pmids": len(new_pmids),
+                            "dup_pmids": len(dup_pmids),
+                            "new_dois": len(set(tfidf_results.doi_map.keys()) - before_dois),
+                        }
+
         # Augment with citation searching if enabled
         citation_stats = None
         if args.citations and args.seeds > 0 and seed_papers:
@@ -1092,7 +1503,7 @@ def run_study(
                 if not sp_pmid:
                     seed_missing_pmid.append(sp.get("title") or "unknown title")
                     continue
-                progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
+                progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
                 cr, work_ids, found = oa_client.get_citations_with_work_ids(
                     sp_pmid,
                     cache=citation_cache,
@@ -1124,7 +1535,7 @@ def run_study(
 
             if depth > 1 and frontier_ids:
                 for level in range(2, depth + 1):
-                    progress.update(task_id, description=f"Citations depth {level}...")
+                    progress.update(task_id, description=f"Citations depth {level}...", splash=maybe_rotate_splash())
                     next_frontier: set[str] = set()
                     frontier_list = sorted(frontier_ids)
                     if max_frontier > 0 and len(frontier_list) > max_frontier:
@@ -1152,7 +1563,7 @@ def run_study(
             citation_cache.save()
 
             # Check how many citation PMIDs match included studies
-            included_pmids = {s.pmid for s in included_studies if s.pmid}
+            included_pmids = {s.pmid for s in eval_included_studies if s.pmid}
             query_pmids_set = set(llm_results.pmid_map.keys())
             new_pmids = citation_pmids - query_pmids_set
 
@@ -1206,6 +1617,7 @@ def run_study(
                 pmid_to_dois: dict[str, list[str]] = {}
 
                 # OpenAlex first (fast, polite pool)
+                progress.update(task_id, description=f"Enriching {len(pmid_list)} citation DOIs via OpenAlex...", splash=maybe_rotate_splash())
                 oa_doi_map = oa_client.resolve_pmids_to_dois(pmid_list)
                 if oa_doi_map:
                     for pmid, doi in oa_doi_map.items():
@@ -1214,6 +1626,7 @@ def run_study(
                 # Fallback to Entrez for missing DOIs
                 missing_pmids = [pmid for pmid in pmid_list if pmid not in pmid_to_dois]
                 if missing_pmids:
+                    progress.update(task_id, description=f"Enriching {len(missing_pmids)} citation DOIs via Entrez...", splash=maybe_rotate_splash())
                     try:
                         entrez_dois = fetch_dois_for_pmids(
                             missing_pmids,
@@ -1262,6 +1675,7 @@ def run_study(
             citation_doi_new = 0
             citation_doi_total = 0
             if citation_openalex_ids:
+                progress.update(task_id, description=f"Resolving {len(citation_openalex_ids)} citation DOIs...", splash=maybe_rotate_splash())
                 id_to_doi = oa_client.resolve_openalex_ids_to_dois(sorted(citation_openalex_ids))
                 if id_to_doi:
                     for doi in id_to_doi.values():
@@ -1285,9 +1699,9 @@ def run_study(
         if args.similar > 0 and seed_papers:
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
             if seed_pmids:
-                found_before = count_found_studies(llm_results, included_studies)
-                total_included = len(included_studies)
-                progress.update(task_id, description="Fetching similar articles...")
+                found_before = count_found_studies(llm_results, eval_included_studies)
+                total_included = len(eval_included_studies)
+                progress.update(task_id, description="Fetching similar articles...", splash=maybe_rotate_splash())
                 similar_map = fetch_similar_pmids(
                     seed_pmids,
                     email=config.entrez_email,
@@ -1308,7 +1722,7 @@ def run_study(
                     llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(similar)"}
                 llm_results.result_count += len(new_pmids)
 
-                found_after = count_found_studies(llm_results, included_studies)
+                found_after = count_found_studies(llm_results, eval_included_studies)
                 delta_found = found_after - found_before
                 if total_included > 0:
                     recall_before = found_before / total_included * 100
@@ -1345,7 +1759,7 @@ def run_study(
         progress.update(task_id, description="Checking PubMed indexing (LLM)...")
         llm_metrics = calculate_metrics_with_pubmed_check(
             llm_results,
-            included_studies,
+            eval_included_studies,
             entrez_email=config.entrez_email,
             rate_delay=rate_delay,
             index_cache=index_cache,
@@ -1353,7 +1767,7 @@ def run_study(
         step("Checked PubMed indexing (LLM)")
 
         # Identify missed papers (PubMed-indexed only, enriched with seed paper metadata)
-        match_results = match_studies(llm_results, included_studies)
+        match_results = match_studies(llm_results, eval_included_studies)
         missed_studies = [mr.study for mr in match_results if not mr.matched]
 
         # Load seed papers JSON to enrich missed papers with metadata
@@ -1428,7 +1842,7 @@ def run_study(
                     progress.update(task_id, description="Checking PubMed indexing (human)...")
                     human_metrics = calculate_metrics_with_pubmed_check(
                         human_results,
-                        included_studies,
+                        eval_included_studies,
                         entrez_email=config.entrez_email,
                         rate_delay=rate_delay,
                         index_cache=index_cache,
@@ -1443,6 +1857,7 @@ def run_study(
                 progress.advance(task_id, 2)
         elif not args.no_human and not study.search_strategy_docx:
             log.print("[yellow]No human search strategy available for this study[/yellow]")
+
 
     # Print per-study results (outside progress context so bar is cleared)
     console.print()
@@ -1465,17 +1880,21 @@ def run_study(
         supplement_stats=supplement_stats,
         similar_stats=similar_stats,
         mesh_entry_stats=mesh_entry_stats,
+        tfidf_query=tfidf_query,
+        tfidf_stats=tfidf_stats,
     )
 
 
 def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Path:
     """Save results to a markdown file in results/."""
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    now = datetime.now()
+    date_str = now.strftime("%Y-%m-%d")
     study_ids = "_".join(r.study_id for r in results)
-    filename = f"results_{study_ids}_{timestamp}.md"
+    results_dir = Path("results") / study_ids / date_str
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = now.strftime("%H%M")
+    filename = f"results_{timestamp}.md"
     filepath = results_dir / filename
 
     lines: list[str] = []
@@ -1486,6 +1905,10 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     lines.append(f"- **N runs**: {args.n}")
     lines.append(f"- **Double prompt**: {args.double_prompt}")
     lines.append(f"- **Seed papers**: {args.seeds}")
+    lines.append(f"- **TF-IDF terms**: {args.tfidf}")
+    if args.tfidf:
+        lines.append(f"- **TF-IDF top terms**: {args.tfidf_top}")
+        lines.append(f"- **TF-IDF max results**: {args.tfidf_max_results}")
     lines.append(f"- **Citations**: {args.citations}")
     if args.citations:
         lines.append(f"- **Citation depth**: {args.citation_depth}")
@@ -1515,11 +1938,15 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
         lines.append(f"| Included studies | {m.total_included} | {h.total_included if h else '—'} |")
         lines.append(f"| Not in PubMed | {m.not_in_pubmed} | {h.not_in_pubmed if h else '—'} |")
         lines.append(f"| PubMed-indexed | {m.pubmed_indexed_count} | {h.pubmed_indexed_count if h else '—'} |")
-        lines.append(f"| Captured | {m.found}/{m.pubmed_indexed_count} | {h.found}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found}/{m.pubmed_indexed_count} | — |")
+        lines.append(
+            f"| Captured | {m.found}/{m.pubmed_indexed_count} | {h.found}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found}/{m.pubmed_indexed_count} | — |")
         lines.append(f"| Missed (in PubMed) | {m.missed_pubmed_indexed} | {h.missed_pubmed_indexed if h else '—'} |")
-        lines.append(f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | {h.recall_overall * 100:.1f}% ({h.found}/{h.total_included}) |" if h else f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | — |")
-        lines.append(f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | — |")
-        lines.append(f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | {h.precision * 100:.2f}% ({h.found}/{h.total_results}) |" if h else f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | — |")
+        lines.append(
+            f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | {h.recall_overall * 100:.1f}% ({h.found}/{h.total_included}) |" if h else f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | — |")
+        lines.append(
+            f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | — |")
+        lines.append(
+            f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | {h.precision * 100:.2f}% ({h.found}/{h.total_results}) |" if h else f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | — |")
         nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
         h_nnr_str = f"{h.nnr:.1f}" if h and h.nnr != float("inf") else "—"
         lines.append(f"| NNR | {nnr_str} | {h_nnr_str} |")
@@ -1542,15 +1969,19 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                 f"{cs.get('seed_not_found_openalex', 0)} not in OpenAlex | — |"
             )
         lines.append(f"")
-        if r.mesh_entry_stats and r.mesh_entry_stats.get("entry_terms_added", 0) > 0:
+        if r.mesh_entry_stats:
             ms = r.mesh_entry_stats
             lines.append("**MeSH entry-term expansion**")
             lines.append(
                 f"- Added {ms.get('entry_terms_added', 0)} terms across "
                 f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
             )
+            lines.append(f"- Headings detected: {len(ms.get('mesh_terms_detected', []))}")
             if ms.get("mesh_year"):
                 lines.append(f"- MeSH year: {ms.get('mesh_year')}")
+            if ms.get("mesh_terms_samples"):
+                samples = ", ".join(f"{t} (+{n})" for t, n in ms["mesh_terms_samples"])
+                lines.append(f"- Samples: {samples}")
             lines.append(f"")
         if r.supplement_stats:
             ss = r.supplement_stats
@@ -1579,6 +2010,26 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                     lines.append("```")
                     lines.append(ps["query"])
                     lines.append("```")
+            lines.append(f"")
+        if r.tfidf_stats:
+            ts = r.tfidf_stats
+            lines.append("**TF-IDF term mining**")
+            lines.append(
+                f"- Docs used: {ts.get('docs_used', 0)} "
+                f"(skipped {ts.get('docs_skipped', 0)})"
+            )
+            lines.append(
+                f"- Terms used: {ts.get('terms_used', 0)} / {ts.get('terms_total', 0)}"
+            )
+            lines.append(f"- Field: {ts.get('field', 'tiab')}")
+            lines.append(
+                f"- TF-IDF results: {ts.get('total_pmids', 0)} total PMIDs, "
+                f"{ts.get('new_pmids', 0)} new, {ts.get('dup_pmids', 0)} already in first pass"
+            )
+            if "new_dois" in ts:
+                lines.append(f"- DOIs added: {ts.get('new_dois', 0)}")
+            if ts.get("terms"):
+                lines.append(f"- Terms: {', '.join(ts['terms'])}")
             lines.append(f"")
         if r.similar_stats:
             ss = r.similar_stats
@@ -1687,6 +2138,12 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             lines.append(r.executed_query)
             lines.append(f"```")
             lines.append(f"")
+        if r.tfidf_query:
+            lines.append(f"**TF-IDF Query:**")
+            lines.append(f"```")
+            lines.append(r.tfidf_query)
+            lines.append(f"```")
+            lines.append(f"")
         if r.human_query:
             lines.append(f"**Human Query:**")
             lines.append(f"```")
@@ -1776,6 +2233,23 @@ def main():
         type=str,
         default="tamk",
         help="Which seed paper fields to include: t=title, a=abstract, m=MeSH, k=keywords (default: tamk = all)",
+    )
+    parser.add_argument(
+        "--tfidf",
+        action="store_true",
+        help="Add a TF-IDF term-mined supplemental query from seed papers (requires --seeds)",
+    )
+    parser.add_argument(
+        "--tfidf-top",
+        type=int,
+        default=8,
+        help="Number of TF-IDF terms to include (default: 8)",
+    )
+    parser.add_argument(
+        "--tfidf-max-results",
+        type=int,
+        default=20000,
+        help="Maximum PubMed results allowed for TF-IDF supplemental query (default: 20000)",
     )
     parser.add_argument(
         "--save-prompt",

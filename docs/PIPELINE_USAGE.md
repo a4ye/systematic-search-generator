@@ -131,6 +131,9 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 | `--double-prompt` | Repeat the full query prompt twice in a single message for emphasis. |
 | `--seeds N` | Include N random seed papers (title, abstract, MeSH, keywords) from `seed_papers/` in the prompt. Papers with missing data are skipped. Default 0 (disabled). |
 | `--seed-fields CODES` | Control which seed paper fields to include: `t`=title, `a`=abstract, `m`=MeSH, `k`=keywords. Default `tamk` (all). E.g. `--seed-fields tm` for title + MeSH only. |
+| `--tfidf` | Add a TF-IDF term-mined supplemental query from seed papers (requires `--seeds`). |
+| `--tfidf-top N` | Number of TF-IDF terms to include (default: 8). |
+| `--tfidf-max-results N` | Maximum PubMed results allowed for the TF-IDF supplemental query (default: 20000). |
 | `--citations` | Augment query results with forward/backward citations of seed papers via the OpenAlex API. Requires `--seeds`. Unions citation PMIDs with Boolean query PMIDs before evaluation. |
 | `--citation-depth N` | Citation expansion depth (1 = direct citations only). |
 | `--citation-direction {both,forward,backward}` | Citation direction to follow (default: both). |

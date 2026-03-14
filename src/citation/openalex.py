@@ -99,15 +99,28 @@ class OpenAlexClient:
         return None, []
 
     def resolve_pmids_to_dois(self, pmids: list[str]) -> dict[str, str]:
-        """Resolve PMIDs to DOIs using OpenAlex work IDs."""
+        """Resolve PMIDs to DOIs using OpenAlex batch filter."""
         pmid_to_doi: dict[str, str] = {}
-        for pmid in pmids:
-            data = self._get(f"/works/pmid:{pmid}", params={"select": "ids"})
+        if not pmids:
+            return pmid_to_doi
+
+        batch_size = 50
+        for i in range(0, len(pmids), batch_size):
+            batch = pmids[i : i + batch_size]
+            filter_str = "pmid:" + "|".join(batch)
+            data = self._get("/works", params={
+                "filter": filter_str,
+                "select": "ids",
+                "per_page": 200,
+            })
             if not data:
                 continue
-            doi = _extract_doi(data.get("ids", {}))
-            if doi:
-                pmid_to_doi[pmid] = doi
+            for work in data.get("results", []):
+                ids = work.get("ids", {})
+                pmid = _extract_pmid(ids)
+                doi = _extract_doi(ids)
+                if pmid and doi:
+                    pmid_to_doi[pmid] = doi
         return pmid_to_doi
 
     def _resolve_openalex_ids_to_pmids(self, openalex_ids: list[str]) -> set[str]:

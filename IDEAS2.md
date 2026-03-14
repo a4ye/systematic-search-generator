@@ -7,9 +7,6 @@
 - **MeSH tree neighborhood expansion (bounded)**  
   Add immediate parents/children in the MeSH hierarchy (bounded depth), then filter by term frequency in included studies to avoid blow‑ups.
 
-- **TF‑IDF term mining from included studies**  
-  Extract discriminative terms from titles/abstracts of included studies (or seed papers) and add the top‑K terms as an extra OR block.
-
 - **Tiered, bounded queries**  
   Run 2–3 narrower query variants (different concept slices), cap each at <20k, then union results to stay under 50k.
 
@@ -21,3 +18,7 @@
 
 - **Journal/title channel**  
   Add a supplemental query restricted to high‑yield journals or title‑only hits for specific terms as a high‑precision add‑on.
+
+## Now in the Pipeline
+- **TF‑IDF term mining from seed papers**  
+  Extract discriminative terms from titles/abstracts of seed papers and run a capped supplemental query (`--tfidf`).
