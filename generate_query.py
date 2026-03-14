@@ -1489,52 +1489,62 @@ def run_study(
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
             query_pmid_count = len(llm_results.pmid_map)
             citation_pmids: set[str] = set()
-            citation_openalex_ids: set[str] = set()
             depth = max(1, int(getattr(args, "citation_depth", 1)))
             direction = getattr(args, "citation_direction", "both")
             max_frontier = int(getattr(args, "citation_max_frontier", 0))
-            frontier_ids: set[str] = set()
-            visited_ids: set[str] = set()
             seed_missing_pmid: list[str] = []
             seed_not_found_openalex: list[str] = []
 
-            for sp in seed_papers:
-                sp_pmid = sp.get("pmid")
-                if not sp_pmid:
-                    seed_missing_pmid.append(sp.get("title") or "unknown title")
-                    continue
-                progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
-                cr, work_ids, found = oa_client.get_citations_with_work_ids(
-                    sp_pmid,
-                    cache=citation_cache,
-                    direction=direction,
-                )
-                if not found:
-                    seed_not_found_openalex.append(sp_pmid)
-                citation_pmids |= cr.all_pmids
-                for wid in work_ids:
-                    if not wid:
+            if depth == 1:
+                # Simple path: use get_citations which returns from cache immediately
+                for sp in seed_papers:
+                    sp_pmid = sp.get("pmid")
+                    if not sp_pmid:
+                        seed_missing_pmid.append(sp.get("title") or "unknown title")
                         continue
-                    citation_openalex_ids.add(wid)
-                    frontier_ids.add(wid)
-                    visited_ids.add(wid)
-                log.print(
-                    f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
-                    f"{len(cr.backward_pmids)} backward[/dim]"
-                )
+                    progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                    cr = oa_client.get_citations(
+                        sp_pmid,
+                        cache=citation_cache,
+                        max_forward=2000,
+                    )
+                    if not cr.forward_pmids and not cr.backward_pmids:
+                        seed_not_found_openalex.append(sp_pmid)
+                    citation_pmids |= cr.all_pmids
+                    log.print(
+                        f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
+                        f"{len(cr.backward_pmids)} backward[/dim]"
+                    )
+            else:
+                # Depth > 1: need work IDs for frontier expansion
+                frontier_ids: set[str] = set()
+                visited_ids: set[str] = set()
+                for sp in seed_papers:
+                    sp_pmid = sp.get("pmid")
+                    if not sp_pmid:
+                        seed_missing_pmid.append(sp.get("title") or "unknown title")
+                        continue
+                    progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                    cr, work_ids, found = oa_client.get_citations_with_work_ids(
+                        sp_pmid,
+                        cache=citation_cache,
+                        direction=direction,
+                    )
+                    if not found:
+                        seed_not_found_openalex.append(sp_pmid)
+                    citation_pmids |= cr.all_pmids
+                    for wid in work_ids:
+                        if wid:
+                            frontier_ids.add(wid)
+                            visited_ids.add(wid)
+                    log.print(
+                        f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
+                        f"{len(cr.backward_pmids)} backward[/dim]"
+                    )
 
-            if seed_missing_pmid:
-                log.print(
-                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) missing PMID; "
-                    "skipping for citations[/yellow]"
-                )
-            if seed_not_found_openalex:
-                log.print(
-                    f"[yellow]  {len(seed_not_found_openalex)} seed PMID(s) not found in OpenAlex (skipping depth expansion for them)[/yellow]"
-                )
-
-            if depth > 1 and frontier_ids:
                 for level in range(2, depth + 1):
+                    if not frontier_ids:
+                        break
                     progress.update(task_id, description=f"Citations depth {level}...", splash=maybe_rotate_splash())
                     next_frontier: set[str] = set()
                     frontier_list = sorted(frontier_ids)
@@ -1550,15 +1560,22 @@ def run_study(
                         )
                         citation_pmids |= pmids
                         for wid in work_ids:
-                            if not wid:
-                                continue
-                            citation_openalex_ids.add(wid)
-                            if wid not in visited_ids:
+                            if wid and wid not in visited_ids:
                                 visited_ids.add(wid)
                                 next_frontier.add(wid)
                     if not next_frontier:
                         break
                     frontier_ids = next_frontier
+
+            if seed_missing_pmid:
+                log.print(
+                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) missing PMID; "
+                    "skipping for citations[/yellow]"
+                )
+            if seed_not_found_openalex:
+                log.print(
+                    f"[yellow]  {len(seed_not_found_openalex)} seed PMID(s) not found in OpenAlex[/yellow]"
+                )
 
             citation_cache.save()
 
@@ -1612,52 +1629,8 @@ def run_study(
                     f"({query_pmid_count} query + {len(new_pmids)} citations "
                     f"= {len(llm_results.pmid_map)} total)[/dim]"
                 )
-                # Enrich citation PMIDs with DOIs so DOI-only included studies can match
-                pmid_list = sorted(new_pmids)
-                pmid_to_dois: dict[str, list[str]] = {}
-
-                # OpenAlex first (fast, polite pool)
-                progress.update(task_id, description=f"Enriching {len(pmid_list)} citation DOIs via OpenAlex...", splash=maybe_rotate_splash())
-                oa_doi_map = oa_client.resolve_pmids_to_dois(pmid_list)
-                if oa_doi_map:
-                    for pmid, doi in oa_doi_map.items():
-                        pmid_to_dois[pmid] = [doi]
-
-                # Fallback to Entrez for missing DOIs
-                missing_pmids = [pmid for pmid in pmid_list if pmid not in pmid_to_dois]
-                if missing_pmids:
-                    progress.update(task_id, description=f"Enriching {len(missing_pmids)} citation DOIs via Entrez...", splash=maybe_rotate_splash())
-                    try:
-                        entrez_dois = fetch_dois_for_pmids(
-                            missing_pmids,
-                            email=config.entrez_email,
-                            api_key=config.entrez_api_key,
-                            rate_delay=rate_delay,
-                            batch_size=config.pubmed_batch_size,
-                        )
-                        for pmid, dois in entrez_dois.items():
-                            pmid_to_dois[pmid] = dois
-                    except Exception as exc:
-                        log.print(f"[yellow]  DOI enrichment via Entrez failed: {exc}[/yellow]")
-
-                if pmid_to_dois:
-                    enriched = 0
-                    for pmid, dois in pmid_to_dois.items():
-                        entry = llm_results.pmid_map.get(pmid)
-                        if entry is None:
-                            entry = {"pmid": pmid, "title": "(citation)"}
-                            llm_results.pmid_map[pmid] = entry
-                        existing = set(entry.get("dois", []))
-                        for doi in dois:
-                            if doi not in existing:
-                                existing.add(doi)
-                                enriched += 1
-                            llm_results.doi_map[doi] = {
-                                "pmid": pmid,
-                                "title": entry.get("title", "(citation)"),
-                            }
-                        entry["dois"] = sorted(existing)
-                    log.print(f"[dim]  Enriched {enriched} DOI mappings for citations[/dim]")
+                # Skip DOI enrichment for citation PMIDs — included studies with DOIs
+                # also have PMIDs, so PMID matching is sufficient and avoids extra API calls.
                 if citation_included_all:
                     parts = []
                     parts.append(f"{len(citation_included_all)} included studies in citations")
@@ -1671,28 +1644,8 @@ def run_study(
             else:
                 log.print("[dim]  No new PMIDs from citations[/dim]")
 
-            # Add DOI-only citation results (OpenAlex works without PMIDs)
-            citation_doi_new = 0
-            citation_doi_total = 0
-            if citation_openalex_ids:
-                progress.update(task_id, description=f"Resolving {len(citation_openalex_ids)} citation DOIs...", splash=maybe_rotate_splash())
-                id_to_doi = oa_client.resolve_openalex_ids_to_dois(sorted(citation_openalex_ids))
-                if id_to_doi:
-                    for doi in id_to_doi.values():
-                        if not doi:
-                            continue
-                        citation_doi_total += 1
-                        if doi in llm_results.doi_map:
-                            continue
-                        llm_results.doi_map[doi] = {"pmid": None, "title": "(citation)"}
-                        citation_doi_new += 1
-
-                    if citation_doi_new:
-                        llm_results.result_count += citation_doi_new
-                        log.print(f"[dim]  Added {citation_doi_new} DOI-only citation results[/dim]")
-
-                    citation_stats["doi_total"] = citation_doi_total
-                    citation_stats["doi_new"] = citation_doi_new
+            # Skip DOI-only citation resolution — included studies with DOIs also have PMIDs,
+            # so this step adds no recall value and is very slow (hundreds of API calls).
 
         # Augment with PubMed "Similar Articles" if enabled
         similar_stats = None
@@ -1957,8 +1910,6 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                 f"cap {cs.get('max_frontier', 0) or 'none'} | — |"
             )
             lines.append(f"| **Citation PMIDs** | {cs['total']} total, {cs['new']} new | — |")
-            if "doi_total" in cs:
-                lines.append(f"| **Citation DOIs** | {cs['doi_total']} total, {cs['doi_new']} new | — |")
             lines.append(
                 f"| **Citation included** | {cs['hits_total']} found ({cs['hits']} new, "
                 f"{cs['hits_already_in_query']} already in query) | — |"

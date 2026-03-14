@@ -63,7 +63,7 @@ class OpenAlexClient:
         self,
         email: str | None = None,
         api_key: str | None = None,
-        rate_delay: float = 0.1,
+        rate_delay: float = 0.2,
     ):
         self.session = requests.Session()
         self.email = email
@@ -72,8 +72,8 @@ class OpenAlexClient:
             self.session.headers["User-Agent"] = f"mailto:{email}"
         self.rate_delay = rate_delay
 
-    def _get(self, endpoint: str, params: dict | None = None) -> dict | None:
-        """Make a GET request to OpenAlex with rate limiting."""
+    def _get(self, endpoint: str, params: dict | None = None, _retries: int = 3) -> dict | None:
+        """Make a GET request to OpenAlex with rate limiting and retry on 429."""
         time.sleep(self.rate_delay)
         url = f"{self.BASE_URL}{endpoint}"
         params = dict(params) if params else {}
@@ -85,6 +85,11 @@ class OpenAlexClient:
             resp = self.session.get(url, params=params, timeout=30)
             if resp.status_code == 404:
                 return None
+            if resp.status_code == 429 and _retries > 0:
+                wait = max(float(resp.headers.get("Retry-After", 2)), 2.0)
+                logger.info("Rate limited, waiting %.1fs (%d retries left)", wait, _retries)
+                time.sleep(wait)
+                return self._get(endpoint, params, _retries=_retries - 1)
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:

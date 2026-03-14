@@ -18,5 +18,7 @@ uv run python generate_query.py "$@" \
   --two-pass-max 5 \
   --similar 100 \
   --mesh-entry-terms \
-  --mesh-entry-max 6 \
-  --tfidf
+  --mesh-entry-max 8 \
+  --tfidf \
+  --tfidf-top 8 \
+  --tfidf-max-results 30000
