@@ -1,9 +1,24 @@
 """Cache for PubMed indexing status of studies."""
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _normalize_doi_key(doi: str) -> str:
+    """Normalize DOI for cache key consistency."""
+    doi = doi.strip().rstrip(".")
+    doi = re.sub(r"^https?://doi\.org/", "", doi, flags=re.IGNORECASE)
+    # Collapse double (or more) slashes to single, only in the suffix after "10.xxx/"
+    prefix_end = doi.find("/")
+    if prefix_end > 0:
+        prefix = doi[:prefix_end]
+        suffix = doi[prefix_end:]
+        suffix = re.sub(r"/{2,}", "/", suffix)
+        doi = prefix + suffix
+    return doi.lower()
 
 
 @dataclass
@@ -49,7 +64,7 @@ class PubMedIndexCache:
         if pmid:
             return f"pmid:{pmid}"
         if doi:
-            return f"doi:{doi.lower()}"
+            return f"doi:{_normalize_doi_key(doi)}"
         return None
 
     def get(self, doi: str | None = None, pmid: str | None = None) -> bool | None:

@@ -353,7 +353,8 @@ def get_missed_seed_papers(
             continue
         matched = False
         if doi:
-            doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).strip().rstrip(".").lower()
+            doi_norm = re.sub(r"^https?://doi\.org/", "", str(doi), flags=re.IGNORECASE)
+            doi_norm = re.sub(r"/{2,}", "/", doi_norm.strip().rstrip(".")).lower()
             if search_results.match_by_doi(doi_norm):
                 matched = True
         if not matched and pmid:
@@ -781,6 +782,50 @@ def build_block_drop_queries(query: str, field_mode: str = "ti") -> list[str]:
             if len(remaining) > 1:
                 candidate = f"({candidate})"
             candidate = _apply_field_restrictions(candidate, field_mode)
+            candidates.append(candidate)
+
+    # Dedupe while preserving order
+    unique: list[str] = []
+    seen = set()
+    for c in candidates:
+        if not c:
+            continue
+        key = c.strip()
+        if key and key not in seen and key != query.strip():
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+# Ordered tightening levels for block-drop auto-tightening.
+# Each is a (label, field_mode) tuple applied to the *raw* candidate.
+_TIGHTEN_LEVELS: list[tuple[str, str]] = [
+    ("ti", "ti"),
+    ("ti+majr", "ti+majr"),
+]
+
+
+def build_block_drop_candidates_raw(query: str) -> list[str]:
+    """Create raw block-drop candidates without field restrictions (for auto-tightening)."""
+    if not query:
+        return []
+
+    top_or_parts = _split_top_level(query, "OR")
+    candidates: list[str] = []
+
+    for part in top_or_parts:
+        part_core = _strip_outer_parens(part)
+        and_blocks = _split_top_level(part_core, "AND")
+        if len(and_blocks) <= 1:
+            continue
+        for drop_idx in range(len(and_blocks)):
+            remaining = [b for i, b in enumerate(and_blocks) if i != drop_idx]
+            if not remaining:
+                continue
+            candidate = " AND ".join(remaining)
+            candidate = candidate.strip()
+            if len(remaining) > 1:
+                candidate = f"({candidate})"
             candidates.append(candidate)
 
     # Dedupe while preserving order
@@ -1491,11 +1536,14 @@ def run_study(
 
         block_drop_stats = None
         if args.block_drop:
+            # Build raw candidates (no field restrictions) for auto-tightening
+            raw_candidates = build_block_drop_candidates_raw(final_query)
+            # Also build with the configured field mode for backward compat
             block_drop_queries = build_block_drop_queries(
                 final_query,
                 field_mode=args.block_drop_field,
             )
-            if not block_drop_queries:
+            if not block_drop_queries and not raw_candidates:
                 log.print("[yellow]Block-drop enabled but no AND blocks found; skipping[/yellow]")
                 progress.advance(task_id, 1)
             else:
@@ -1509,28 +1557,69 @@ def run_study(
                 total_dup_pmids = 0
                 total_new_dois = 0
                 skipped = 0
+                tightened_count = 0
 
-                for i, q in enumerate(block_drop_queries, 1):
-                    label = f"Block-drop query {i}/{len(block_drop_queries)}"
+                # Build tightening levels: start with the configured mode, then escalate
+                configured_mode = args.block_drop_field or "ti"
+                tighten_levels = []
+                for level_label, level_mode in _TIGHTEN_LEVELS:
+                    tighten_levels.append((level_label, level_mode))
+                # Ensure configured mode is first if not already in the list
+                configured_in_list = any(m == configured_mode for _, m in tighten_levels)
+                if not configured_in_list:
+                    tighten_levels.insert(0, (configured_mode, configured_mode))
+
+                for i, raw_q in enumerate(raw_candidates, 1):
+                    label = f"Block-drop query {i}/{len(raw_candidates)}"
                     progress.update(
                         task_id,
                         description=f"{label}: counting results...",
                         splash=maybe_rotate_splash(),
                     )
-                    result = fetch_or_cached(
-                        q,
-                        label,
-                        max_count=max_results,
-                        advance_step=False,
-                    )
+
+                    # Try each tightening level until one fits under max_results
+                    result = None
+                    used_level = None
+                    for level_label, level_mode in tighten_levels:
+                        tightened_q = _apply_field_restrictions(raw_q, level_mode)
+                        # Check count first via cache or API
+                        cached_result = query_cache.get(tightened_q)
+                        if cached_result:
+                            count = cached_result.result_count
+                        else:
+                            count = pubmed.count_results(tightened_q)
+
+                        if count <= max_results:
+                            result = fetch_or_cached(
+                                tightened_q,
+                                label,
+                                max_count=max_results,
+                                known_count=count,
+                                advance_step=False,
+                            )
+                            used_level = level_label
+                            break
+                        else:
+                            log.print(
+                                f"[dim]  {label} [{level_label}]: {count:,} results "
+                                f"(> {max_results:,}), tightening...[/dim]"
+                            )
+
                     if result is None:
                         skipped += 1
                         per_query.append({
-                            "query": q,
+                            "query": raw_q,
                             "skipped": True,
                             "reason": "too_broad",
                         })
                         continue
+
+                    if used_level and used_level != configured_mode:
+                        tightened_count += 1
+                        log.print(
+                            f"[dim]  {label}: auto-tightened to [{used_level}] "
+                            f"({result.result_count:,} results)[/dim]"
+                        )
 
                     pmids = set(result.pmid_map.keys())
                     new_pmids = pmids - before_pmids
@@ -1553,13 +1642,14 @@ def run_study(
                     total_new_dois += len(new_dois)
 
                     per_query.append({
-                        "query": q,
+                        "query": result.query if hasattr(result, 'query') else raw_q,
                         "skipped": False,
                         "result_count": result.result_count,
                         "total_pmids": len(pmids),
                         "new_pmids": len(new_pmids),
                         "dup_pmids": len(dup_pmids),
                         "new_dois": len(new_dois),
+                        "field_level": used_level,
                     })
 
                 found_after = count_found_studies(llm_results, eval_included_studies)
@@ -1567,9 +1657,11 @@ def run_study(
                 recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
                 recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
 
+                tightened_msg = f", {tightened_count} auto-tightened" if tightened_count else ""
                 log.print(
-                    f"[dim]  Block-drop: {len(block_drop_queries)} queries, "
-                    f"{total_new_pmids} new PMIDs, {total_dup_pmids} already in query[/dim]"
+                    f"[dim]  Block-drop: {len(raw_candidates)} queries, "
+                    f"{total_new_pmids} new PMIDs, {total_dup_pmids} already in query"
+                    f"{tightened_msg}[/dim]"
                 )
                 log.print(
                     f"[dim]  Block-drop recall: {found_before}->{found_after} "
@@ -1577,8 +1669,9 @@ def run_study(
                 )
 
                 block_drop_stats = {
-                    "queries_total": len(block_drop_queries),
+                    "queries_total": len(raw_candidates),
                     "queries_skipped": skipped,
+                    "queries_tightened": tightened_count,
                     "max_results": max_results,
                     "field_mode": args.block_drop_field,
                     "total_new_pmids": total_new_pmids,

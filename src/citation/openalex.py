@@ -30,7 +30,14 @@ def _extract_doi(ids: dict) -> str | None:
     doi = ids.get("doi")
     if not doi:
         return None
-    doi = _DOI_PREFIX_RE.sub("", doi).strip()
+    doi = _DOI_PREFIX_RE.sub("", doi).strip().rstrip(".")
+    # Collapse double slashes (APA journal quirk)
+    prefix_end = doi.find("/")
+    if prefix_end > 0:
+        prefix = doi[:prefix_end]
+        suffix = doi[prefix_end:]
+        suffix = re.sub(r"/{2,}", "/", suffix)
+        doi = prefix + suffix
     return doi.lower() if doi else None
 
 

@@ -15,7 +15,7 @@ uv run python generate_query.py "$@" \
   --citations \
   --citation-depth 1 \
   --two-pass \
-  --two-pass-max 5 \
+  --two-pass-max 10 \
   --similar 100 \
   --mesh-entry-terms \
   --mesh-entry-max 8 \

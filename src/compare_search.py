@@ -32,7 +32,7 @@ class PubMedSearchResults:
             for aid in rec.get("AID", []):
                 if "[doi]" in aid:
                     doi = aid.replace("[doi]", "").strip()
-                    dois.add(doi.lower())
+                    dois.add(normalize_doi(doi))
 
             # Also check LID field
             lid = rec.get("LID", "")
@@ -40,7 +40,7 @@ class PubMedSearchResults:
                 lid = " ".join(lid)
             if "[doi]" in lid:
                 doi = lid.split("[doi]")[0].strip()
-                dois.add(doi.lower())
+                dois.add(normalize_doi(doi))
 
             # Store in PMID map
             if pmid:
@@ -52,8 +52,8 @@ class PubMedSearchResults:
 
     def match_study(self, study: "IncludedStudy") -> dict[str, str] | None:
         """Try to match an included study by DOI first, then by PMID."""
-        if study.doi and study.doi in self.doi_map:
-            return self.doi_map[study.doi]
+        if study.doi and normalize_doi(study.doi) in self.doi_map:
+            return self.doi_map[normalize_doi(study.doi)]
         if study.pmid and study.pmid in self.pmid_map:
             return self.pmid_map[study.pmid]
         return None
@@ -117,11 +117,33 @@ def lookup_doi_metadata(doi: str) -> dict[str, Any] | None:
         return {"pmid": None, "in_pubmed": False, "doi": doi, "error": str(e)}
 
 
+def normalize_doi(doi: str) -> str:
+    """Normalize a DOI string for consistent matching.
+
+    Handles known quirks:
+    - Trailing periods from data entry
+    - Double slashes (e.g., APA journals: 10.1037//0022-3514.84.2.377)
+    - URL prefixes (https://doi.org/...)
+    - Case normalization
+    """
+    doi = doi.strip().rstrip(".")
+    doi = re.sub(r"^https?://doi\.org/", "", doi, flags=re.IGNORECASE)
+    # Collapse double (or more) slashes to single, but only after the "10." prefix
+    # DOIs are structured as 10.PREFIX/SUFFIX — the double slash quirk occurs in the suffix
+    prefix_end = doi.find("/")
+    if prefix_end > 0:
+        prefix = doi[:prefix_end]
+        suffix = doi[prefix_end:]
+        suffix = re.sub(r"/{2,}", "/", suffix)
+        doi = prefix + suffix
+    return doi.lower()
+
+
 class IncludedStudy:
     """Represents a study from the included studies file."""
 
     def __init__(self, doi: str | None = None, pmid: str | None = None, title: str | None = None):
-        self.doi = doi.strip().rstrip(".").lower() if doi else None
+        self.doi = normalize_doi(doi) if doi else None
         self.pmid = str(pmid).strip() if pmid else None
         self.title = title.strip() if title else None
 

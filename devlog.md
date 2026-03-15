@@ -427,7 +427,7 @@ more ideas:
 - prune n queries with the longest and/or shortest results to find a better balance between recall and precision
 
 NOTE: Embase requires a paid subscription
-NOTE: error in data that deflated the recall, since some of the DOIs ended with a period causing them to not get matched properly.
+NOTE: error in data that deflated the recall, since some of the DOIs ended with a period causing them to not get matched properly. Also double slashes
 
 ## Next Steps
 

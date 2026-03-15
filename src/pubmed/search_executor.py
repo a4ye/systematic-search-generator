@@ -1,5 +1,6 @@
 """Execute PubMed queries via Entrez API."""
 
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,6 +10,23 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 
 from Bio import Entrez, Medline
+
+
+def _normalize_doi(doi: str) -> str:
+    """Normalize a DOI for consistent matching.
+
+    Strips URL prefix, trailing periods, collapses double slashes (APA quirk).
+    """
+    doi = doi.strip().rstrip(".")
+    doi = re.sub(r"^https?://doi\.org/", "", doi, flags=re.IGNORECASE)
+    # Collapse double (or more) slashes to single, only in the suffix after "10.xxx/"
+    prefix_end = doi.find("/")
+    if prefix_end > 0:
+        prefix = doi[:prefix_end]
+        suffix = doi[prefix_end:]
+        suffix = re.sub(r"/{2,}", "/", suffix)
+        doi = prefix + suffix
+    return doi.lower()
 
 
 @dataclass
@@ -40,7 +58,7 @@ class PubMedSearchResults:
             for aid in rec.get("AID", []):
                 if "[doi]" in aid:
                     doi = aid.replace("[doi]", "").strip()
-                    dois.add(doi.lower())
+                    dois.add(_normalize_doi(doi))
 
             # Also check LID field
             lid = rec.get("LID", "")
@@ -48,7 +66,7 @@ class PubMedSearchResults:
                 lid = " ".join(lid)
             if "[doi]" in lid:
                 doi = lid.split("[doi]")[0].strip()
-                dois.add(doi.lower())
+                dois.add(_normalize_doi(doi))
 
             # Store in PMID map
             if pmid:
@@ -60,7 +78,7 @@ class PubMedSearchResults:
 
     def match_by_doi(self, doi: str) -> dict[str, Any] | None:
         """Try to match a DOI."""
-        return self.doi_map.get(doi.lower())
+        return self.doi_map.get(_normalize_doi(doi))
 
     def match_by_pmid(self, pmid: str) -> dict[str, Any] | None:
         """Try to match a PMID."""
@@ -89,7 +107,7 @@ class PubMedSearchResults:
         for pmid in pmids:
             instance.pmid_map[pmid] = {"pmid": pmid, "title": "(cached)"}
         for doi, pmid in doi_to_pmid.items():
-            instance.doi_map[doi.lower()] = {"pmid": pmid, "title": "(cached)"}
+            instance.doi_map[_normalize_doi(doi)] = {"pmid": pmid, "title": "(cached)"}
         return instance
 
 
@@ -302,7 +320,7 @@ class PubMedExecutor:
                         if eloc and eloc.startswith("doi:"):
                             doi = eloc[4:].strip()
                     if pmid and doi:
-                        pmid_to_doi[pmid] = doi.lower()
+                        pmid_to_doi[pmid] = _normalize_doi(doi)
             completed_batches += 1
             if progress_callback and total_batches:
                 progress_callback(completed_batches, total_batches)
