@@ -190,8 +190,8 @@ def main():
     row("Search results", str(m.total_results), str(h.total_results) if h else None)
     row(
         "Captured",
-        f"{m.found} / {m.pubmed_indexed_count}",
-        f"{h.found} / {h.pubmed_indexed_count}" if h else None,
+        f"{m.found_pubmed} / {m.pubmed_indexed_count}",
+        f"{h.found_pubmed} / {h.pubmed_indexed_count}" if h else None,
     )
     row(
         "Missed (in PubMed)",
@@ -205,8 +205,8 @@ def main():
     )
     row(
         "Recall (PubMed only)",
-        f"{m.recall_pubmed_only*100:.1f}%  ({m.found}/{m.pubmed_indexed_count})",
-        f"{h.recall_pubmed_only*100:.1f}%  ({h.found}/{h.pubmed_indexed_count})" if h else None,
+        f"{m.recall_pubmed_only*100:.1f}%  ({m.found_pubmed}/{m.pubmed_indexed_count})",
+        f"{h.recall_pubmed_only*100:.1f}%  ({h.found_pubmed}/{h.pubmed_indexed_count})" if h else None,
     )
     row(
         "Precision",
