@@ -146,6 +146,8 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 | `--mesh-entry-terms` | Expand MeSH terms with entry-term free-text variants. |
 | `--mesh-entry-max N` | Maximum number of entry terms per MeSH heading (default: 6). |
 | `--similar N` | Fetch up to N PubMed "Similar Articles" per seed paper and merge results (0 = disabled). |
+| `--similar-augment N` | Second-round similar articles: fetch up to N per augmentation-hit PMID (0 = disabled). Runs on PMIDs added by two-pass, block-drop, TF-IDF, citations, and round-1 similar articles. |
+| `--similar-augment-sample N` | Max augmentation-hit PMIDs to sample for second-round similar articles (default: 10). |
 | `--show-missed` | Append a "Missed Papers" section to the results file listing PubMed-indexed papers not captured by the query, with title, abstract, MeSH terms, and keywords (enriched from `seed_papers/` cache). |
 | `--save-prompt` | Append the full composed LLM prompt to the results file. |
 | `--no-human` | Skip human strategy comparison. |

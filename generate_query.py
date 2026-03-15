@@ -627,6 +627,7 @@ class StudyResult:
     supplement_query: str | None = None
     supplement_stats: dict | None = None
     similar_stats: dict | None = None
+    similar_augment_stats: dict | None = None
     mesh_entry_stats: dict | None = None
     tfidf_query: str | None = None
     tfidf_stats: dict | None = None
@@ -639,6 +640,7 @@ def _calculate_total_steps(
         include_human: bool,
         two_pass: bool,
         similar: bool,
+        similar_augment: bool,
         tfidf: bool,
         block_drop: bool,
         two_pass_max: int,
@@ -658,6 +660,8 @@ def _calculate_total_steps(
         total += 2 * max(1, two_pass_max)  # supplement LLM + supplement fetch (max passes)
     if similar:
         total += 1  # similar articles fetch
+    if similar_augment:
+        total += 1  # similar articles round 2 (augmentation hits)
     if tfidf:
         total += 1  # TF-IDF supplemental query
     if block_drop:
@@ -929,8 +933,8 @@ def print_study_table(
     )
     table.add_row(
         "Captured",
-        f"{fmt_count(m.found)} / {fmt_count(m.pubmed_indexed_count)}",
-        f"{fmt_count(h.found)} / {fmt_count(h.pubmed_indexed_count)}" if h else na,
+        f"{fmt_count(m.found_pubmed)} / {fmt_count(m.pubmed_indexed_count)}",
+        f"{fmt_count(h.found_pubmed)} / {fmt_count(h.pubmed_indexed_count)}" if h else na,
         fmt_diff_count(m.found, h.found) if h else na,
     )
     table.add_row(
@@ -953,8 +957,8 @@ def print_study_table(
     )
     table.add_row(
         "Recall (PubMed only)",
-        f"{m.recall_pubmed_only * 100:.1f}%  ({fmt_count(m.found)}/{fmt_count(m.pubmed_indexed_count)})",
-        f"{h.recall_pubmed_only * 100:.1f}%  ({fmt_count(h.found)}/{fmt_count(h.pubmed_indexed_count)})" if h else na,
+        f"{m.recall_pubmed_only * 100:.1f}%  ({fmt_count(m.found_pubmed)}/{fmt_count(m.pubmed_indexed_count)})",
+        f"{h.recall_pubmed_only * 100:.1f}%  ({fmt_count(h.found_pubmed)}/{fmt_count(h.pubmed_indexed_count)})" if h else na,
         fmt_diff_pct(m.recall_pubmed_only, h.recall_pubmed_only) if h else na,
     )
 
@@ -986,13 +990,14 @@ def aggregate_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetric
     total_results = sum(m.total_results for m in metrics_list)
     total_included = sum(m.total_included for m in metrics_list)
     found = sum(m.found for m in metrics_list)
+    found_pubmed = sum(m.found_pubmed for m in metrics_list)
     not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list)
     missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list)
     missed = total_included - found
     pubmed_indexed = total_included - not_in_pubmed
 
     recall_overall = found / total_included if total_included > 0 else 0.0
-    recall_pubmed = found / pubmed_indexed if pubmed_indexed > 0 else 0.0
+    recall_pubmed = found_pubmed / pubmed_indexed if pubmed_indexed > 0 else 0.0
     precision = found / total_results if total_results > 0 else 0.0
     nnr = total_results / found if found > 0 else float("inf")
     if precision + recall_overall > 0:
@@ -1004,6 +1009,7 @@ def aggregate_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetric
         total_results=total_results,
         total_included=total_included,
         found=found,
+        found_pubmed=found_pubmed,
         missed=missed,
         not_in_pubmed=not_in_pubmed,
         missed_pubmed_indexed=missed_pubmed_indexed,
@@ -1023,6 +1029,7 @@ def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
             total_results=0,
             total_included=0,
             found=0,
+            found_pubmed=0,
             missed=0,
             not_in_pubmed=0,
             missed_pubmed_indexed=0,
@@ -1036,6 +1043,7 @@ def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
     total_results = sum(m.total_results for m in metrics_list) / n
     total_included = sum(m.total_included for m in metrics_list) / n
     found = sum(m.found for m in metrics_list) / n
+    found_pubmed = sum(m.found_pubmed for m in metrics_list) / n
     not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list) / n
     missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list) / n
     missed = total_included - found
@@ -1054,6 +1062,7 @@ def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
         total_results=total_results,
         total_included=total_included,
         found=found,
+        found_pubmed=found_pubmed,
         missed=missed,
         not_in_pubmed=not_in_pubmed,
         missed_pubmed_indexed=missed_pubmed_indexed,
@@ -1112,6 +1121,7 @@ def run_study(
         include_human,
         args.two_pass,
         args.similar > 0,
+        args.similar_augment > 0,
         args.tfidf,
         args.block_drop,
         args.two_pass_max,
@@ -1395,6 +1405,8 @@ def run_study(
 
         supplement_query = None
         supplement_stats = None
+        # Snapshot baseline PMIDs before any augmentation (for second-round similar)
+        baseline_pmids = set(llm_results.pmid_map.keys())
 
         # Optional two-pass refinement: generate a supplemental query for missed seed papers
         if args.two_pass:
@@ -2135,6 +2147,78 @@ def run_study(
             else:
                 log.print("[yellow]Similar articles enabled but no seed PMIDs available[/yellow]")
 
+        # Second-round similar articles on augmentation hits
+        similar_augment_stats = None
+        if args.similar_augment > 0:
+            # Collect all PMIDs added by augmentation steps (two-pass, block-drop, tfidf, citations, round-1 similar)
+            augmentation_pmids = set(llm_results.pmid_map.keys()) - baseline_pmids
+            if augmentation_pmids:
+                sample_size = min(len(augmentation_pmids), max(1, args.similar_augment_sample))
+                sampled = random.sample(sorted(augmentation_pmids), sample_size)
+                log.print(
+                    f"[dim]  Similar-augment: sampling {len(sampled)} of "
+                    f"{len(augmentation_pmids)} augmentation-hit PMIDs[/dim]"
+                )
+
+                found_before = count_found_studies(llm_results, eval_included_studies)
+                total_included = len(eval_included_studies)
+                progress.update(task_id, description="Fetching similar articles (round 2)...", splash=maybe_rotate_splash())
+                aug_similar_map = fetch_similar_pmids(
+                    sampled,
+                    email=config.entrez_email,
+                    api_key=config.entrez_api_key,
+                    rate_delay=rate_delay,
+                    per_seed=args.similar_augment,
+                )
+                step("Fetched similar articles (round 2)")
+
+                aug_similar_pmids = set()
+                for pmids in aug_similar_map.values():
+                    aug_similar_pmids.update(pmids)
+
+                before_pmids = set(llm_results.pmid_map.keys())
+                new_pmids = aug_similar_pmids - before_pmids
+                dup_pmids = aug_similar_pmids & before_pmids
+
+                for pmid in new_pmids:
+                    llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(similar-r2)"}
+                llm_results.result_count += len(new_pmids)
+
+                found_after = count_found_studies(llm_results, eval_included_studies)
+                delta_found = found_after - found_before
+                if total_included > 0:
+                    recall_before = found_before / total_included * 100
+                    recall_after = found_after / total_included * 100
+                else:
+                    recall_before = 0.0
+                    recall_after = 0.0
+
+                log.print(
+                    f"[dim]  Similar-augment: {len(aug_similar_pmids)} total PMIDs, "
+                    f"{len(new_pmids)} new, {len(dup_pmids)} already in results[/dim]"
+                )
+                log.print(
+                    f"[dim]  Similar-augment recall: {found_before}->{found_after} "
+                    f"(+{delta_found}) "
+                    f"[{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
+                )
+
+                similar_augment_stats = {
+                    "augmentation_pool": len(augmentation_pmids),
+                    "sampled": len(sampled),
+                    "per_pmid": args.similar_augment,
+                    "total_pmids": len(aug_similar_pmids),
+                    "new_pmids": len(new_pmids),
+                    "dup_pmids": len(dup_pmids),
+                    "found_before": found_before,
+                    "found_after": found_after,
+                    "delta_found": delta_found,
+                    "recall_before": recall_before,
+                    "recall_after": recall_after,
+                }
+            else:
+                log.print("[dim]  Similar-augment: no augmentation-hit PMIDs to sample[/dim]")
+
         progress.update(task_id, description="Checking PubMed indexing (LLM)...")
         llm_metrics = calculate_metrics_with_pubmed_check(
             llm_results,
@@ -2258,6 +2342,7 @@ def run_study(
         supplement_query=supplement_query,
         supplement_stats=supplement_stats,
         similar_stats=similar_stats,
+        similar_augment_stats=similar_augment_stats,
         mesh_entry_stats=mesh_entry_stats,
         tfidf_query=tfidf_query,
         tfidf_stats=tfidf_stats,
@@ -2307,6 +2392,9 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     if args.mesh_entry_terms:
         lines.append(f"- **MeSH entry-term max**: {args.mesh_entry_max}")
     lines.append(f"- **Similar articles per seed**: {args.similar}")
+    if args.similar_augment > 0:
+        lines.append(f"- **Similar-augment per PMID**: {args.similar_augment}")
+        lines.append(f"- **Similar-augment sample size**: {args.similar_augment_sample}")
     lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
     lines.append(f"")
 
@@ -2323,12 +2411,12 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
         lines.append(f"| Not in PubMed | {m.not_in_pubmed} | {h.not_in_pubmed if h else '—'} |")
         lines.append(f"| PubMed-indexed | {m.pubmed_indexed_count} | {h.pubmed_indexed_count if h else '—'} |")
         lines.append(
-            f"| Captured | {m.found}/{m.pubmed_indexed_count} | {h.found}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found}/{m.pubmed_indexed_count} | — |")
+            f"| Captured | {m.found_pubmed}/{m.pubmed_indexed_count} | {h.found_pubmed}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found_pubmed}/{m.pubmed_indexed_count} | — |")
         lines.append(f"| Missed (in PubMed) | {m.missed_pubmed_indexed} | {h.missed_pubmed_indexed if h else '—'} |")
         lines.append(
             f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | {h.recall_overall * 100:.1f}% ({h.found}/{h.total_included}) |" if h else f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | — |")
         lines.append(
-            f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count}) | — |")
+            f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found_pubmed}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count}) | — |")
         lines.append(
             f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | {h.precision * 100:.2f}% ({h.found}/{h.total_results}) |" if h else f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | — |")
         nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
@@ -2465,6 +2553,27 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                     f"{ss.get('recall_before', 0.0):.1f}% -> {ss.get('recall_after', 0.0):.1f}%"
                 )
             lines.append(f"")
+        if r.similar_augment_stats:
+            sa = r.similar_augment_stats
+            lines.append("**Similar articles (round 2 — augmentation hits)**")
+            lines.append(
+                f"- Augmentation pool: {sa.get('augmentation_pool', 0)} PMIDs, "
+                f"sampled {sa.get('sampled', 0)}"
+            )
+            lines.append(
+                f"- Per-PMID cap: {sa.get('per_pmid', 0)}"
+            )
+            lines.append(
+                f"- Results: {sa.get('total_pmids', 0)} total PMIDs, "
+                f"{sa.get('new_pmids', 0)} new, {sa.get('dup_pmids', 0)} already in results"
+            )
+            if "found_before" in sa:
+                lines.append(
+                    f"- Recall impact: {sa.get('found_before', 0)} -> {sa.get('found_after', 0)} "
+                    f"(+{sa.get('delta_found', 0)}), "
+                    f"{sa.get('recall_before', 0.0):.1f}% -> {sa.get('recall_after', 0.0):.1f}%"
+                )
+            lines.append(f"")
 
     # Summary table if multiple studies
     if len(results) > 1:
@@ -2482,11 +2591,11 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             h = r.human_metrics
             label = f"{r.study_id} - {r.study_name}"
             recall_str = f"{m.recall_overall * 100:.1f}% ({m.found}/{m.total_included})"
-            recall_pm_str = f"{m.recall_pubmed_only * 100:.1f}% ({m.found}/{m.pubmed_indexed_count})"
+            recall_pm_str = f"{m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count})"
             precision_str = f"{m.precision * 100:.2f}%"
             nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
             h_recall_str = f"{h.recall_overall * 100:.1f}% ({h.found}/{h.total_included})" if h else "—"
-            h_recall_pm_str = f"{h.recall_pubmed_only * 100:.1f}% ({h.found}/{h.pubmed_indexed_count})" if h else "—"
+            h_recall_pm_str = f"{h.recall_pubmed_only * 100:.1f}% ({h.found_pubmed}/{h.pubmed_indexed_count})" if h else "—"
             h_results_str = str(h.total_results) if h else "—"
             h_precision_str = f"{h.precision * 100:.2f}%" if h else "—"
             lines.append(
@@ -2724,6 +2833,18 @@ def main():
         type=int,
         default=0,
         help="Fetch up to N similar articles per seed paper and merge results (0 = disabled)",
+    )
+    parser.add_argument(
+        "--similar-augment",
+        type=int,
+        default=0,
+        help="Second-round similar articles: fetch up to N per augmentation-hit PMID (0 = disabled)",
+    )
+    parser.add_argument(
+        "--similar-augment-sample",
+        type=int,
+        default=10,
+        help="Max augmentation-hit PMIDs to sample for second-round similar articles (default: 10)",
     )
     parser.add_argument(
         "--citation-depth",

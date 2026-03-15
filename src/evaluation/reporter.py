@@ -133,9 +133,9 @@ class Reporter:
         )
         table.add_row(
             "Captured",
-            f"{llm.found} / {llm.pubmed_indexed_count}" if llm else "N/A",
-            f"{human.found} / {human.pubmed_indexed_count}" if human else "N/A",
-            fmt_int_diff("found", higher_is_better=True),
+            f"{llm.found_pubmed} / {llm.pubmed_indexed_count}" if llm else "N/A",
+            f"{human.found_pubmed} / {human.pubmed_indexed_count}" if human else "N/A",
+            fmt_int_diff("found_pubmed", higher_is_better=True),
         )
         table.add_row(
             "Missed (in PubMed)",
@@ -151,8 +151,8 @@ class Reporter:
         )
         table.add_row(
             "Recall (PubMed only)",
-            f"{llm.recall_pubmed_only*100:.1f}%  ({llm.found}/{llm.pubmed_indexed_count})" if llm else "N/A",
-            f"{human.recall_pubmed_only*100:.1f}%  ({human.found}/{human.pubmed_indexed_count})" if human else "N/A",
+            f"{llm.recall_pubmed_only*100:.1f}%  ({llm.found_pubmed}/{llm.pubmed_indexed_count})" if llm else "N/A",
+            f"{human.recall_pubmed_only*100:.1f}%  ({human.found_pubmed}/{human.pubmed_indexed_count})" if human else "N/A",
             fmt_diff("recall_pubmed_only", is_pct=True),
         )
         # Precision diff with relative change

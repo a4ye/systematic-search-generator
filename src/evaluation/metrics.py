@@ -18,6 +18,7 @@ class EvaluationMetrics:
     total_results: int
     total_included: int
     found: int
+    found_pubmed: int  # Found studies that are confirmed PubMed-indexed
     missed: int
     not_in_pubmed: int
     missed_pubmed_indexed: int  # Missed but actually in PubMed
@@ -194,6 +195,7 @@ def calculate_metrics(
         total_results=total_results,
         total_included=total_included,
         found=found,
+        found_pubmed=found_pubmed,
         missed=missed,
         not_in_pubmed=not_in_pubmed_count,
         missed_pubmed_indexed=missed_pubmed_indexed,
@@ -226,9 +228,8 @@ def calculate_metrics_with_pubmed_check(
     total_results = search_results.result_count
     total_included = len(included_studies)
 
-    # Match studies and identify missed ones
+    # Match studies and identify found vs missed
     found_studies = []
-    found_pubmed = []
     missed_studies = []
 
     for study in included_studies:
@@ -240,30 +241,36 @@ def calculate_metrics_with_pubmed_check(
 
         if match:
             found_studies.append(study)
-            if match.get("pmid"):
-                found_pubmed.append(study)
-            else:
-                missed_studies.append(study)
         else:
             missed_studies.append(study)
 
     found = len(found_studies)
-    found_pubmed_count = len(found_pubmed)
     missed = len(missed_studies)
 
-    # Check which missed studies are actually indexed in PubMed (batch lookup)
-    not_in_pubmed = 0
-    missed_pubmed_indexed = 0
-
-    if missed_studies:
-        indexed_results = check_pubmed_indexed_batch(missed_studies, rate_delay, cache=index_cache)
-        for idx, study in enumerate(missed_studies):
-            if indexed_results.get(idx, False):
-                missed_pubmed_indexed += 1
-            else:
-                not_in_pubmed += 1
-
+    # Check PubMed indexing for ALL included studies (not just missed ones)
+    # so that not_in_pubmed / pubmed_indexed counts are consistent regardless
+    # of which query is used.  The index_cache makes repeat calls cheap.
+    indexed_results = check_pubmed_indexed_batch(
+        included_studies, rate_delay, cache=index_cache,
+    )
+    not_in_pubmed = sum(
+        1 for idx in range(len(included_studies))
+        if not indexed_results.get(idx, False)
+    )
     pubmed_indexed = total_included - not_in_pubmed
+
+    # Count found/missed studies that are PubMed-indexed
+    found_set = set(id(s) for s in found_studies)
+    missed_set = set(id(s) for s in missed_studies)
+    found_pubmed_count = 0
+    missed_pubmed_indexed = 0
+    for idx, study in enumerate(included_studies):
+        if not indexed_results.get(idx, False):
+            continue
+        if id(study) in found_set:
+            found_pubmed_count += 1
+        elif id(study) in missed_set:
+            missed_pubmed_indexed += 1
 
     # Calculate metrics
     recall_overall = found / total_included if total_included > 0 else 0.0
@@ -281,6 +288,7 @@ def calculate_metrics_with_pubmed_check(
         total_results=total_results,
         total_included=total_included,
         found=found,
+        found_pubmed=found_pubmed_count,
         missed=missed,
         not_in_pubmed=not_in_pubmed,
         missed_pubmed_indexed=missed_pubmed_indexed,

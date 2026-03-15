@@ -22,6 +22,8 @@ uv run python generate_query.py "$@" \
   --tfidf \
   --tfidf-top 8 \
   --tfidf-max-results 30000 \
-  --block-drop
+  --block-drop \
+  --similar-augment 100 \
+  --similar-augment-sample 20
 
 notify-send done
