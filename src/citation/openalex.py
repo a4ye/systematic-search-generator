@@ -103,6 +103,27 @@ class OpenAlexClient:
             return data.get("id"), data.get("referenced_works", [])
         return None, []
 
+    def _get_openalex_id_by_doi(self, doi: str) -> tuple[str | None, list[str], str | None]:
+        """Look up the OpenAlex ID and PMID for a DOI.
+
+        Returns (openalex_id, referenced_works, pmid).
+        """
+        data = self._get(
+            f"/works/doi:{doi}",
+            params={"select": "id,ids,referenced_works"},
+        )
+        if data:
+            pmid = _extract_pmid(data.get("ids", {}))
+            return data.get("id"), data.get("referenced_works", []), pmid
+        return None, [], None
+
+    def resolve_doi_to_pmid(self, doi: str) -> str | None:
+        """Resolve a DOI to a PMID via OpenAlex."""
+        data = self._get(f"/works/doi:{doi}", params={"select": "ids"})
+        if data:
+            return _extract_pmid(data.get("ids", {}))
+        return None
+
     def resolve_pmids_to_dois(self, pmids: list[str]) -> dict[str, str]:
         """Resolve PMIDs to DOIs using OpenAlex batch filter."""
         pmid_to_doi: dict[str, str] = {}
@@ -330,6 +351,122 @@ class OpenAlexClient:
         if direction in ("both", "forward") and forward_ids:
             all_ids.extend(forward_ids)
         return result, all_ids, True
+
+    def get_citations_by_doi(
+        self,
+        doi: str,
+        cache: CitationCache | None = None,
+        max_forward: int = 2000,
+    ) -> tuple[CitationResult, str | None]:
+        """Get forward and backward citations for a DOI.
+
+        Returns (CitationResult, resolved_pmid). The cache key is the
+        resolved PMID when available, otherwise the DOI prefixed with "doi:".
+        """
+        # Look up in OpenAlex by DOI to get openalex_id, referenced_works, and PMID
+        openalex_id, referenced_works, resolved_pmid = self._get_openalex_id_by_doi(doi)
+
+        # Determine cache key: prefer resolved PMID, fall back to "doi:<doi>"
+        cache_key = resolved_pmid or f"doi:{doi.lower()}"
+
+        # Check cache
+        if cache:
+            cached = cache.get(cache_key)
+            if cached:
+                return CitationResult(
+                    pmid=cache_key,
+                    forward_pmids=set(cached["forward_pmids"]),
+                    backward_pmids=set(cached["backward_pmids"]),
+                ), resolved_pmid
+
+        result = CitationResult(pmid=cache_key)
+
+        if not openalex_id:
+            logger.info("DOI %s not found in OpenAlex", doi)
+            if cache:
+                cache.set(cache_key, [], [], save=False)
+            return result, resolved_pmid
+
+        # Backward citations
+        if referenced_works:
+            result.backward_pmids = self._resolve_openalex_ids_to_pmids(referenced_works)
+
+        # Forward citations
+        result.forward_pmids = self._get_forward_citations(openalex_id, max_results=max_forward)
+
+        if cache:
+            cache.set(
+                cache_key,
+                sorted(result.forward_pmids),
+                sorted(result.backward_pmids),
+                save=False,
+            )
+
+        return result, resolved_pmid
+
+    def get_citations_with_work_ids_by_doi(
+        self,
+        doi: str,
+        cache: CitationCache | None = None,
+        max_forward: int = 2000,
+        direction: str = "both",
+    ) -> tuple[CitationResult, list[str], bool, str | None]:
+        """Get citation PMIDs and OpenAlex work IDs for a DOI.
+
+        Returns (CitationResult, work_ids, found, resolved_pmid).
+        """
+        openalex_id, referenced_works, resolved_pmid = self._get_openalex_id_by_doi(doi)
+        cache_key = resolved_pmid or f"doi:{doi.lower()}"
+
+        cached_result: CitationResult | None = None
+        if cache:
+            cached = cache.get(cache_key)
+            if cached:
+                cached_result = CitationResult(
+                    pmid=cache_key,
+                    forward_pmids=set(cached["forward_pmids"]),
+                    backward_pmids=set(cached["backward_pmids"]),
+                )
+
+        result = cached_result or CitationResult(pmid=cache_key)
+
+        if not openalex_id:
+            logger.info("DOI %s not found in OpenAlex", doi)
+            if cache and not cached_result:
+                cache.set(cache_key, [], [], save=False)
+            return result, [], False, resolved_pmid
+
+        forward_pmids: set[str] = set()
+        forward_ids: list[str] = []
+        if direction in ("both", "forward"):
+            forward_pmids, forward_ids = self._get_forward_citations_with_ids(
+                openalex_id, max_results=max_forward
+            )
+            if not cached_result:
+                result.forward_pmids = forward_pmids
+        elif not cached_result:
+            result.forward_pmids = set()
+
+        if direction in ("both", "backward"):
+            if referenced_works and not cached_result:
+                result.backward_pmids = self._resolve_openalex_ids_to_pmids(referenced_works)
+        elif not cached_result:
+            result.backward_pmids = set()
+
+        if cache and not cached_result:
+            cache.set(
+                cache_key,
+                sorted(result.forward_pmids),
+                sorted(result.backward_pmids),
+                save=False,
+            )
+
+        all_ids = []
+        if direction in ("both", "backward") and referenced_works:
+            all_ids.extend(referenced_works)
+        if direction in ("both", "forward") and forward_ids:
+            all_ids.extend(forward_ids)
+        return result, all_ids, True, resolved_pmid
 
     def get_citations_for_work_id(
         self,

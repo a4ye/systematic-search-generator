@@ -121,7 +121,7 @@ class IncludedStudy:
     """Represents a study from the included studies file."""
 
     def __init__(self, doi: str | None = None, pmid: str | None = None, title: str | None = None):
-        self.doi = doi.lower() if doi else None
+        self.doi = doi.strip().rstrip(".").lower() if doi else None
         self.pmid = str(pmid).strip() if pmid else None
         self.title = title.strip() if title else None
 

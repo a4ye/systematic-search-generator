@@ -21,4 +21,7 @@ uv run python generate_query.py "$@" \
   --mesh-entry-max 8 \
   --tfidf \
   --tfidf-top 8 \
-  --tfidf-max-results 30000
+  --tfidf-max-results 30000 \
+  --block-drop
+
+notify-send done

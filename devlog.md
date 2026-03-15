@@ -426,6 +426,8 @@ more ideas:
 - new idea: multiple narrow queries and then merge the results, instead of one broad query, which might improve precision while maintaining recall
 - prune n queries with the longest and/or shortest results to find a better balance between recall and precision
 
+NOTE: Embase requires a paid subscription
+NOTE: error in data that deflated the recall, since some of the DOIs ended with a period causing them to not get matched properly.
 
 ## Next Steps
 

@@ -134,6 +134,9 @@ The script runs two LLM calls: first extracting the structured plan from the PDF
 | `--tfidf` | Add a TF-IDF term-mined supplemental query from seed papers (requires `--seeds`). |
 | `--tfidf-top N` | Number of TF-IDF terms to include (default: 8). |
 | `--tfidf-max-results N` | Maximum PubMed results allowed for the TF-IDF supplemental query (default: 20000). |
+| `--block-drop` | Add block-drop supplemental queries by removing one top-level AND block. |
+| `--block-drop-max-results N` | Maximum PubMed results allowed for block-drop queries (default: 20000). |
+| `--block-drop-field MODE` | Field-tightening mode for block-drop queries: `none`, `ti`, `majr`, `ti+majr` (default: `ti`). |
 | `--citations` | Augment query results with forward/backward citations of seed papers via the OpenAlex API. Requires `--seeds`. Unions citation PMIDs with Boolean query PMIDs before evaluation. |
 | `--citation-depth N` | Citation expansion depth (1 = direct citations only). |
 | `--citation-direction {both,forward,backward}` | Citation direction to follow (default: both). |

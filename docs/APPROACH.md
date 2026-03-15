@@ -27,19 +27,22 @@ PROSPERO PDF
 [5] Two-pass supplement (LLM, iterative)
     │
     ▼
-[6] TF-IDF term mining (no LLM)
+[6] Block-drop supplement (no LLM)
     │
     ▼
-[7] Citation searching (OpenAlex API)
+[7] TF-IDF term mining (no LLM)
     │
     ▼
-[8] PubMed Similar Articles (Entrez API)
+[8] Citation searching (OpenAlex API)
     │
     ▼
-[9] Evaluate against included studies
+[9] PubMed Similar Articles (Entrez API)
+    │
+    ▼
+[10] Evaluate against included studies
 ```
 
-All augmentation steps (5-8) union their results into a single combined result set. Each step uses only the seed papers (known beforehand) — never the full included studies list — so there is no information leakage.
+All augmentation steps (5-9) union their results into a single combined result set. Each step uses only the seed papers (known beforehand) — never the full included studies list — so there is no information leakage.
 
 ## Step-by-step
 
@@ -81,13 +84,19 @@ After the initial query is executed, the pipeline checks which seed papers were 
 
 This is a closed-loop repair: the system only checks whether its own query retrieves papers it was already shown (the seeds), so no ground truth is used.
 
-### 6. TF-IDF term mining (`--tfidf`, `--tfidf-top`)
+### 6. Block-drop supplement (`--block-drop`, `--block-drop-max-results`, `--block-drop-field`)
+
+The pipeline generates supplemental queries by dropping one top-level AND block from the final query (e.g., dropping the population block). Each variant is optionally tightened by field (`ti`, `majr`, or both), capped by `--block-drop-max-results`, and then merged into the main result set if it stays under the cap.
+
+This expands recall for topics where a single block is overly restrictive, while the field tightening and max-results cap help control precision loss.
+
+### 7. TF-IDF term mining (`--tfidf`, `--tfidf-top`)
 
 Seed paper titles and abstracts are tokenized and scored with TF-IDF to identify distinctive terms that characterize the topic. The top-ranked terms (after filtering stopwords and overly common biomedical vocabulary) are used to build a supplemental PubMed query.
 
 The pipeline iteratively tries the top N terms, narrowing down if the result count exceeds `--tfidf-max-results`, and falls back to title-only field restriction if needed. Results are merged into the main result set.
 
-### 7. Citation searching (`--citations`, `--citation-depth`, `--citation-direction`)
+### 8. Citation searching (`--citations`, `--citation-depth`, `--citation-direction`)
 
 For each seed paper with a PMID, the pipeline queries the OpenAlex API to retrieve:
 
@@ -102,11 +111,11 @@ Results are cached locally per PMID so subsequent runs with the same seeds make 
 
 **Direction** (`--citation-direction`): Can be `both` (default), `forward`, or `backward`.
 
-### 8. PubMed Similar Articles (`--similar N`)
+### 9. PubMed Similar Articles (`--similar N`)
 
 For each seed paper PMID, PubMed's "Similar Articles" feature is queried via the Entrez `elink` API. This returns papers that PubMed considers topically related based on its internal document similarity model. Up to N similar articles per seed are fetched and merged.
 
-### 9. Evaluation
+### 10. Evaluation
 
 The combined result set (base query + all augmentations) is compared against the included studies list. Metrics computed:
 

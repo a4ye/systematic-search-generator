@@ -353,7 +353,7 @@ def get_missed_seed_papers(
             continue
         matched = False
         if doi:
-            doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
+            doi_norm = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).strip().rstrip(".").lower()
             if search_results.match_by_doi(doi_norm):
                 matched = True
         if not matched and pmid:
@@ -591,7 +591,7 @@ def filter_tfidf_terms(terms: list[str], query: str) -> list[str]:
     return filtered
 
 
-def build_tfidf_query(terms: list[str], field: str = "tiab") -> str:
+def build_tfidf_query(terms: list[str], field: str = "tiab", joiner: str = "OR") -> str:
     if field == "ti":
         formatter = _format_ti
     else:
@@ -599,7 +599,10 @@ def build_tfidf_query(terms: list[str], field: str = "tiab") -> str:
     formatted = [formatter(t) for t in terms if formatter(t)]
     if not formatted:
         return ""
-    return "(" + " OR ".join(formatted) + ")"
+    joiner_norm = joiner.strip().upper() if joiner else "OR"
+    if joiner_norm not in ("OR", "AND"):
+        joiner_norm = "OR"
+    return "(" + f" {joiner_norm} ".join(formatted) + ")"
 
 
 # ── End configuration ────────────────────────────────────────────────────────
@@ -626,6 +629,7 @@ class StudyResult:
     mesh_entry_stats: dict | None = None
     tfidf_query: str | None = None
     tfidf_stats: dict | None = None
+    block_drop_stats: dict | None = None
     error: str | None = None
 
 
@@ -635,6 +639,7 @@ def _calculate_total_steps(
         two_pass: bool,
         similar: bool,
         tfidf: bool,
+        block_drop: bool,
         two_pass_max: int,
 ) -> int:
     """Calculate the total number of progress steps for a study pipeline.
@@ -654,6 +659,8 @@ def _calculate_total_steps(
         total += 1  # similar articles fetch
     if tfidf:
         total += 1  # TF-IDF supplemental query
+    if block_drop:
+        total += 1  # block-drop supplemental queries
     if include_human:
         total += 3  # strategy extract + fetch + evaluate
     return total
@@ -685,6 +692,108 @@ def extract_query_from_response(text: str) -> str:
 
     # Fallback: return entire text stripped
     return text.strip()
+
+
+def _strip_outer_parens(text: str) -> str:
+    """Strip redundant outer parentheses from a query fragment."""
+    s = text.strip()
+    while s.startswith("(") and s.endswith(")"):
+        depth = 0
+        closed_at_end = False
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    closed_at_end = (i == len(s) - 1)
+                    break
+        if depth != 0 or not closed_at_end:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def _split_top_level(query: str, operator: str) -> list[str]:
+    """Split a query by a boolean operator at top level (not inside parens/quotes)."""
+    token = f" {operator.strip().upper()} "
+    if not token.strip():
+        return [query.strip()]
+    parts: list[str] = []
+    depth = 0
+    in_quotes = False
+    start = 0
+    i = 0
+    while i < len(query):
+        ch = query[i]
+        if ch == "\"":
+            in_quotes = not in_quotes
+            i += 1
+            continue
+        if not in_quotes:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0:
+                if query[i:i + len(token)].upper() == token:
+                    parts.append(query[start:i].strip())
+                    i += len(token)
+                    start = i
+                    continue
+        i += 1
+    parts.append(query[start:].strip())
+    return [p for p in parts if p]
+
+
+def _apply_field_restrictions(query: str, mode: str) -> str:
+    """Apply field-tightening to a query (e.g., [tiab]->[ti], [Mesh]->[Majr])."""
+    mode_norm = (mode or "none").lower()
+    if mode_norm in ("none", "off", "false", "0"):
+        return query
+    tightened = query
+    if "ti" in mode_norm:
+        tightened = re.sub(r"\[tiab\]", "[ti]", tightened, flags=re.IGNORECASE)
+    if "majr" in mode_norm:
+        tightened = re.sub(r"\[mesh\]", "[Majr]", tightened, flags=re.IGNORECASE)
+    return tightened
+
+
+def build_block_drop_queries(query: str, field_mode: str = "ti") -> list[str]:
+    """Create block-drop supplemental queries by removing one top-level AND block."""
+    if not query:
+        return []
+
+    top_or_parts = _split_top_level(query, "OR")
+    candidates: list[str] = []
+
+    for part in top_or_parts:
+        part_core = _strip_outer_parens(part)
+        and_blocks = _split_top_level(part_core, "AND")
+        if len(and_blocks) <= 1:
+            continue
+        for drop_idx in range(len(and_blocks)):
+            remaining = [b for i, b in enumerate(and_blocks) if i != drop_idx]
+            if not remaining:
+                continue
+            candidate = " AND ".join(remaining)
+            candidate = candidate.strip()
+            if len(remaining) > 1:
+                candidate = f"({candidate})"
+            candidate = _apply_field_restrictions(candidate, field_mode)
+            candidates.append(candidate)
+
+    # Dedupe while preserving order
+    unique: list[str] = []
+    seen = set()
+    for c in candidates:
+        if not c:
+            continue
+        key = c.strip()
+        if key and key not in seen and key != query.strip():
+            seen.add(key)
+            unique.append(c)
+    return unique
 
 
 def print_study_table(
@@ -959,6 +1068,7 @@ def run_study(
         args.two_pass,
         args.similar > 0,
         args.tfidf,
+        args.block_drop,
         args.two_pass_max,
     )
 
@@ -1098,7 +1208,18 @@ def run_study(
                 label: str,
                 max_count: int = 50000,
                 known_count: int | None = None,
+                advance_step: bool = True,
         ) -> PubMedSearchResults | None:
+            def maybe_step(description: str) -> None:
+                if advance_step:
+                    step(description)
+                else:
+                    progress.update(
+                        task_id,
+                        description=description,
+                        splash=maybe_rotate_splash(),
+                    )
+
             cached_result = query_cache.get(query)
             if cached_result:
                 if cached_result.result_count > max_count:
@@ -1106,10 +1227,10 @@ def run_study(
                         f"[red]{label} too broad (cached): {cached_result.result_count:,} results "
                         f"(max {max_count:,})[/red]"
                     )
-                    step(f"{label}: too broad")
+                    maybe_step(f"{label}: too broad")
                     return None
                 log.print(f"[dim]{label}: using cached PubMed results[/dim]")
-                step(f"{label}: cached")
+                maybe_step(f"{label}: cached")
                 return PubMedSearchResults.from_cached(
                     query=query,
                     pmids=cached_result.pmids,
@@ -1128,7 +1249,7 @@ def run_study(
                 log.print(
                     f"[red]{label} too broad: {result_count:,} results (max {max_count:,})[/red]"
                 )
-                step(f"{label}: too broad")
+                maybe_step(f"{label}: too broad")
                 return None
 
             progress.update(task_id, description=f"{label}: fetching {result_count:,} results...",
@@ -1154,7 +1275,7 @@ def run_study(
             )
             if batch_task_id is not None:
                 progress.remove_task(batch_task_id)
-            step(f"{label}: fetched {result_count:,}")
+            maybe_step(f"{label}: fetched {result_count:,}")
 
             pmids = list(search_results.pmid_map.keys())
             doi_to_pmid = {doi: info["pmid"] for doi, info in search_results.doi_map.items()}
@@ -1368,6 +1489,110 @@ def run_study(
                         "passes": [],
                     }
 
+        block_drop_stats = None
+        if args.block_drop:
+            block_drop_queries = build_block_drop_queries(
+                final_query,
+                field_mode=args.block_drop_field,
+            )
+            if not block_drop_queries:
+                log.print("[yellow]Block-drop enabled but no AND blocks found; skipping[/yellow]")
+                progress.advance(task_id, 1)
+            else:
+                max_results = max(1, int(args.block_drop_max_results))
+                before_pmids = set(llm_results.pmid_map.keys())
+                before_dois = set(llm_results.doi_map.keys())
+                found_before = count_found_studies(llm_results, eval_included_studies)
+                total_included = len(eval_included_studies)
+                per_query: list[dict] = []
+                total_new_pmids = 0
+                total_dup_pmids = 0
+                total_new_dois = 0
+                skipped = 0
+
+                for i, q in enumerate(block_drop_queries, 1):
+                    label = f"Block-drop query {i}/{len(block_drop_queries)}"
+                    progress.update(
+                        task_id,
+                        description=f"{label}: counting results...",
+                        splash=maybe_rotate_splash(),
+                    )
+                    result = fetch_or_cached(
+                        q,
+                        label,
+                        max_count=max_results,
+                        advance_step=False,
+                    )
+                    if result is None:
+                        skipped += 1
+                        per_query.append({
+                            "query": q,
+                            "skipped": True,
+                            "reason": "too_broad",
+                        })
+                        continue
+
+                    pmids = set(result.pmid_map.keys())
+                    new_pmids = pmids - before_pmids
+                    dup_pmids = pmids & before_pmids
+                    new_dois = set(result.doi_map.keys()) - before_dois
+
+                    for pmid, info in result.pmid_map.items():
+                        if pmid not in llm_results.pmid_map:
+                            llm_results.pmid_map[pmid] = info
+                    for doi, info in result.doi_map.items():
+                        if doi not in llm_results.doi_map:
+                            llm_results.doi_map[doi] = info
+
+                    llm_results.result_count += len(new_pmids)
+                    before_pmids |= new_pmids
+                    before_dois |= new_dois
+
+                    total_new_pmids += len(new_pmids)
+                    total_dup_pmids += len(dup_pmids)
+                    total_new_dois += len(new_dois)
+
+                    per_query.append({
+                        "query": q,
+                        "skipped": False,
+                        "result_count": result.result_count,
+                        "total_pmids": len(pmids),
+                        "new_pmids": len(new_pmids),
+                        "dup_pmids": len(dup_pmids),
+                        "new_dois": len(new_dois),
+                    })
+
+                found_after = count_found_studies(llm_results, eval_included_studies)
+                delta_found = found_after - found_before
+                recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
+                recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
+
+                log.print(
+                    f"[dim]  Block-drop: {len(block_drop_queries)} queries, "
+                    f"{total_new_pmids} new PMIDs, {total_dup_pmids} already in query[/dim]"
+                )
+                log.print(
+                    f"[dim]  Block-drop recall: {found_before}->{found_after} "
+                    f"(+{delta_found}) [{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
+                )
+
+                block_drop_stats = {
+                    "queries_total": len(block_drop_queries),
+                    "queries_skipped": skipped,
+                    "max_results": max_results,
+                    "field_mode": args.block_drop_field,
+                    "total_new_pmids": total_new_pmids,
+                    "total_dup_pmids": total_dup_pmids,
+                    "total_new_dois": total_new_dois,
+                    "found_before": found_before,
+                    "found_after": found_after,
+                    "delta_found": delta_found,
+                    "recall_before": recall_before,
+                    "recall_after": recall_after,
+                    "queries": per_query,
+                }
+                step("Block-drop supplements")
+
         tfidf_query = None
         tfidf_stats = None
         if args.tfidf:
@@ -1387,12 +1612,13 @@ def run_study(
                 selected_terms: list[str] | None = None
                 selected_count: int | None = None
                 selected_field: str = "tiab"
+                selected_joiner: str = "OR"
 
                 while attempt >= 1:
                     candidate_terms = tfidf_terms[:attempt]
                     last_count: int | None = None
                     for field in ("tiab", "ti"):
-                        candidate_query = build_tfidf_query(candidate_terms, field=field)
+                        candidate_query = build_tfidf_query(candidate_terms, field=field, joiner="OR")
                         if not candidate_query:
                             continue
                         cached = query_cache.get(candidate_query)
@@ -1412,6 +1638,7 @@ def run_study(
                             selected_terms = candidate_terms
                             selected_count = count
                             selected_field = field
+                            selected_joiner = "OR"
                             break
                     if tfidf_query:
                         break
@@ -1426,12 +1653,36 @@ def run_study(
                         attempt -= 1
 
                 if not tfidf_query or not selected_terms:
+                    # Final fallback: tighten by AND-ing top terms in title only.
+                    strict_terms = tfidf_terms[: min(2, len(tfidf_terms))]
+                    strict_query = build_tfidf_query(strict_terms, field="ti", joiner="AND") if strict_terms else ""
+                    strict_count: int | None = None
+                    if strict_query:
+                        cached = query_cache.get(strict_query)
+                        if cached:
+                            strict_count = cached.result_count
+                        else:
+                            progress.update(
+                                task_id,
+                                description="TF-IDF query: tightening with AND (title-only)...",
+                                splash=maybe_rotate_splash(),
+                            )
+                            strict_count = pubmed.count_results(strict_query)
+                    if strict_query and strict_count is not None and strict_count <= max_count:
+                        tfidf_query = strict_query
+                        selected_terms = strict_terms
+                        selected_count = strict_count
+                        selected_field = "ti"
+                        selected_joiner = "AND"
+                        log.print("[dim]  TF-IDF query: tightened to title-only AND[/dim]")
+
+                if not tfidf_query or not selected_terms:
                     log.print(
                         f"[yellow]TF-IDF query too broad (>{max_count:,} results); skipping[/yellow]"
                     )
                     progress.advance(task_id, 1)
                 else:
-                    if selected_field == "ti":
+                    if selected_field == "ti" and selected_joiner == "OR":
                         log.print("[dim]  TF-IDF query: fell back to title-only terms[/dim]")
                     tfidf_results = fetch_or_cached(
                         tfidf_query,
@@ -1466,6 +1717,7 @@ def run_study(
                             "terms_used": len(selected_terms),
                             "terms": selected_terms,
                             "field": selected_field,
+                            "joiner": selected_joiner,
                             "max_results": max_count,
                             "result_count": selected_count or len(tfidf_pmids),
                             "total_pmids": len(tfidf_pmids),
@@ -1487,60 +1739,115 @@ def run_study(
             )
 
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
+            seed_doi_only = [p for p in seed_papers if not p.get("pmid") and p.get("doi")]
             query_pmid_count = len(llm_results.pmid_map)
             citation_pmids: set[str] = set()
             depth = max(1, int(getattr(args, "citation_depth", 1)))
             direction = getattr(args, "citation_direction", "both")
             max_frontier = int(getattr(args, "citation_max_frontier", 0))
             seed_missing_pmid: list[str] = []
+            seed_no_id: list[str] = []
             seed_not_found_openalex: list[str] = []
+            doi_resolved_pmids: list[str] = []  # PMIDs resolved from DOI-only seeds
 
             if depth == 1:
                 # Simple path: use get_citations which returns from cache immediately
                 for sp in seed_papers:
                     sp_pmid = sp.get("pmid")
-                    if not sp_pmid:
-                        seed_missing_pmid.append(sp.get("title") or "unknown title")
+                    sp_doi = sp.get("doi")
+                    if not sp_pmid and not sp_doi:
+                        seed_no_id.append(sp.get("title") or "unknown title")
                         continue
-                    progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
-                    cr = oa_client.get_citations(
-                        sp_pmid,
-                        cache=citation_cache,
-                        max_forward=2000,
-                    )
-                    if not cr.forward_pmids and not cr.backward_pmids:
-                        seed_not_found_openalex.append(sp_pmid)
-                    citation_pmids |= cr.all_pmids
-                    log.print(
-                        f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
-                        f"{len(cr.backward_pmids)} backward[/dim]"
-                    )
+                    if sp_pmid:
+                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                        cr = oa_client.get_citations(
+                            sp_pmid,
+                            cache=citation_cache,
+                            max_forward=2000,
+                        )
+                        if not cr.forward_pmids and not cr.backward_pmids:
+                            seed_not_found_openalex.append(sp_pmid)
+                        citation_pmids |= cr.all_pmids
+                        log.print(
+                            f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
+                            f"{len(cr.backward_pmids)} backward[/dim]"
+                        )
+                    else:
+                        # DOI-only seed: look up via DOI
+                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
+                        cr, resolved_pmid = oa_client.get_citations_by_doi(
+                            sp_doi,
+                            cache=citation_cache,
+                            max_forward=2000,
+                        )
+                        if not cr.forward_pmids and not cr.backward_pmids:
+                            seed_not_found_openalex.append(f"doi:{sp_doi}")
+                        citation_pmids |= cr.all_pmids
+                        label = f"DOI {sp_doi}"
+                        if resolved_pmid:
+                            label += f" (PMID {resolved_pmid})"
+                            doi_resolved_pmids.append(resolved_pmid)
+                            seed_pmids.append(resolved_pmid)
+                        else:
+                            seed_missing_pmid.append(sp.get("title") or sp_doi)
+                        log.print(
+                            f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
+                            f"{len(cr.backward_pmids)} backward[/dim]"
+                        )
             else:
                 # Depth > 1: need work IDs for frontier expansion
                 frontier_ids: set[str] = set()
                 visited_ids: set[str] = set()
                 for sp in seed_papers:
                     sp_pmid = sp.get("pmid")
-                    if not sp_pmid:
-                        seed_missing_pmid.append(sp.get("title") or "unknown title")
+                    sp_doi = sp.get("doi")
+                    if not sp_pmid and not sp_doi:
+                        seed_no_id.append(sp.get("title") or "unknown title")
                         continue
-                    progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
-                    cr, work_ids, found = oa_client.get_citations_with_work_ids(
-                        sp_pmid,
-                        cache=citation_cache,
-                        direction=direction,
-                    )
-                    if not found:
-                        seed_not_found_openalex.append(sp_pmid)
-                    citation_pmids |= cr.all_pmids
-                    for wid in work_ids:
-                        if wid:
-                            frontier_ids.add(wid)
-                            visited_ids.add(wid)
-                    log.print(
-                        f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
-                        f"{len(cr.backward_pmids)} backward[/dim]"
-                    )
+                    if sp_pmid:
+                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                        cr, work_ids, found = oa_client.get_citations_with_work_ids(
+                            sp_pmid,
+                            cache=citation_cache,
+                            direction=direction,
+                        )
+                        if not found:
+                            seed_not_found_openalex.append(sp_pmid)
+                        citation_pmids |= cr.all_pmids
+                        for wid in work_ids:
+                            if wid:
+                                frontier_ids.add(wid)
+                                visited_ids.add(wid)
+                        log.print(
+                            f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
+                            f"{len(cr.backward_pmids)} backward[/dim]"
+                        )
+                    else:
+                        # DOI-only seed: look up via DOI
+                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
+                        cr, work_ids, found, resolved_pmid = oa_client.get_citations_with_work_ids_by_doi(
+                            sp_doi,
+                            cache=citation_cache,
+                            direction=direction,
+                        )
+                        if not found:
+                            seed_not_found_openalex.append(f"doi:{sp_doi}")
+                        citation_pmids |= cr.all_pmids
+                        for wid in work_ids:
+                            if wid:
+                                frontier_ids.add(wid)
+                                visited_ids.add(wid)
+                        label = f"DOI {sp_doi}"
+                        if resolved_pmid:
+                            label += f" (PMID {resolved_pmid})"
+                            doi_resolved_pmids.append(resolved_pmid)
+                            seed_pmids.append(resolved_pmid)
+                        else:
+                            seed_missing_pmid.append(sp.get("title") or sp_doi)
+                        log.print(
+                            f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
+                            f"{len(cr.backward_pmids)} backward[/dim]"
+                        )
 
                 for level in range(2, depth + 1):
                     if not frontier_ids:
@@ -1567,14 +1874,24 @@ def run_study(
                         break
                     frontier_ids = next_frontier
 
+            if doi_resolved_pmids:
+                log.print(
+                    f"[green]  {len(doi_resolved_pmids)} DOI-only seed(s) resolved to PMID: "
+                    f"{', '.join(doi_resolved_pmids)}[/green]"
+                )
+            if seed_no_id:
+                log.print(
+                    f"[yellow]  {len(seed_no_id)} seed paper(s) have no PMID or DOI; "
+                    "skipping for citations[/yellow]"
+                )
             if seed_missing_pmid:
                 log.print(
-                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) missing PMID; "
-                    "skipping for citations[/yellow]"
+                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) could not be resolved to PMID "
+                    "(DOI not found in OpenAlex)[/yellow]"
                 )
             if seed_not_found_openalex:
                 log.print(
-                    f"[yellow]  {len(seed_not_found_openalex)} seed PMID(s) not found in OpenAlex[/yellow]"
+                    f"[yellow]  {len(seed_not_found_openalex)} seed(s) not found in OpenAlex[/yellow]"
                 )
 
             citation_cache.save()
@@ -1613,6 +1930,7 @@ def run_study(
                 "query_count": query_pmid_count,
                 "seed_total": len(seed_papers),
                 "seed_with_pmid": len(seed_pmids),
+                "seed_doi_resolved": len(doi_resolved_pmids),
                 "seed_missing_pmid": len(seed_missing_pmid),
                 "seed_not_found_openalex": len(seed_not_found_openalex),
                 "depth": depth,
@@ -1651,6 +1969,21 @@ def run_study(
         similar_stats = None
         if args.similar > 0 and seed_papers:
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
+            # Resolve DOI-only seeds to PMIDs if not already done by citation step
+            if not args.citations:
+                from src.citation.openalex import OpenAlexClient as OAClient
+                _oa = OAClient(
+                    email=config.openalex_email or config.entrez_email,
+                    api_key=config.openalex_api_key,
+                )
+                for sp in seed_papers:
+                    if not sp.get("pmid") and sp.get("doi"):
+                        resolved = _oa.resolve_doi_to_pmid(sp["doi"])
+                        if resolved:
+                            seed_pmids.append(resolved)
+                            log.print(
+                                f"[dim]  DOI {sp['doi']} resolved to PMID {resolved} for similar articles[/dim]"
+                            )
             if seed_pmids:
                 found_before = count_found_studies(llm_results, eval_included_studies)
                 total_included = len(eval_included_studies)
@@ -1835,6 +2168,7 @@ def run_study(
         mesh_entry_stats=mesh_entry_stats,
         tfidf_query=tfidf_query,
         tfidf_stats=tfidf_stats,
+        block_drop_stats=block_drop_stats,
     )
 
 
@@ -1862,6 +2196,10 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
     if args.tfidf:
         lines.append(f"- **TF-IDF top terms**: {args.tfidf_top}")
         lines.append(f"- **TF-IDF max results**: {args.tfidf_max_results}")
+    lines.append(f"- **Block-drop supplement**: {args.block_drop}")
+    if args.block_drop:
+        lines.append(f"- **Block-drop max results**: {args.block_drop_max_results}")
+        lines.append(f"- **Block-drop field**: {args.block_drop_field}")
     lines.append(f"- **Citations**: {args.citations}")
     if args.citations:
         lines.append(f"- **Citation depth**: {args.citation_depth}")
@@ -1915,8 +2253,9 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                 f"{cs['hits_already_in_query']} already in query) | — |"
             )
             lines.append(
-                f"| **Seed papers** | {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID, "
-                f"{cs.get('seed_missing_pmid', 0)} missing PMID, "
+                f"| **Seed papers** | {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID"
+                + (f", {cs['seed_doi_resolved']} via DOI" if cs.get('seed_doi_resolved') else "")
+                + f", {cs.get('seed_missing_pmid', 0)} missing PMID, "
                 f"{cs.get('seed_not_found_openalex', 0)} not in OpenAlex | — |"
             )
         lines.append(f"")
@@ -1962,6 +2301,32 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
                     lines.append(ps["query"])
                     lines.append("```")
             lines.append(f"")
+        if r.block_drop_stats:
+            bs = r.block_drop_stats
+            lines.append("**Block-drop supplement**")
+            lines.append(
+                f"- Queries: {bs.get('queries_total', 0)} "
+                f"(skipped {bs.get('queries_skipped', 0)})"
+            )
+            lines.append(
+                f"- Field mode: {bs.get('field_mode', 'none')} | "
+                f"Max results: {bs.get('max_results', 0)}"
+            )
+            lines.append(
+                f"- Block-drop results: {bs.get('total_new_pmids', 0)} new PMIDs, "
+                f"{bs.get('total_dup_pmids', 0)} already in first pass"
+            )
+            lines.append(
+                f"- Recall impact: {bs.get('found_before', 0)} -> {bs.get('found_after', 0)} "
+                f"(+{bs.get('delta_found', 0)}), "
+                f"{bs.get('recall_before', 0.0):.1f}% -> {bs.get('recall_after', 0.0):.1f}%"
+            )
+            for q in bs.get("queries", []):
+                if q.get("query"):
+                    lines.append("```")
+                    lines.append(q["query"])
+                    lines.append("```")
+            lines.append(f"")
         if r.tfidf_stats:
             ts = r.tfidf_stats
             lines.append("**TF-IDF term mining**")
@@ -1972,7 +2337,12 @@ def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Pat
             lines.append(
                 f"- Terms used: {ts.get('terms_used', 0)} / {ts.get('terms_total', 0)}"
             )
-            lines.append(f"- Field: {ts.get('field', 'tiab')}")
+            field = ts.get("field", "tiab")
+            joiner = (ts.get("joiner") or "OR").upper()
+            if joiner != "OR":
+                lines.append(f"- Field: {field} ({joiner})")
+            else:
+                lines.append(f"- Field: {field}")
             lines.append(
                 f"- TF-IDF results: {ts.get('total_pmids', 0)} total PMIDs, "
                 f"{ts.get('new_pmids', 0)} new, {ts.get('dup_pmids', 0)} already in first pass"
@@ -2201,6 +2571,23 @@ def main():
         type=int,
         default=20000,
         help="Maximum PubMed results allowed for TF-IDF supplemental query (default: 20000)",
+    )
+    parser.add_argument(
+        "--block-drop",
+        action="store_true",
+        help="Add block-drop supplemental queries by removing one top-level AND block",
+    )
+    parser.add_argument(
+        "--block-drop-max-results",
+        type=int,
+        default=20000,
+        help="Maximum PubMed results allowed for block-drop supplemental queries (default: 20000)",
+    )
+    parser.add_argument(
+        "--block-drop-field",
+        type=str,
+        default="ti",
+        help="Field-tightening mode for block-drop queries: none, ti, majr, ti+majr (default: ti)",
     )
     parser.add_argument(
         "--save-prompt",
