@@ -1581,6 +1581,8 @@ def run_study(
                 if not configured_in_list:
                     tighten_levels.insert(0, (configured_mode, configured_mode))
 
+                # Phase 1: Count results and determine tightening level for each candidate
+                eligible: list[tuple[str, str, int]] = []  # (tightened_query, level_label, count)
                 for i, raw_q in enumerate(raw_candidates, 1):
                     label = f"Block-drop query {i}/{len(raw_candidates)}"
                     progress.update(
@@ -1590,26 +1592,27 @@ def run_study(
                     )
 
                     # Try each tightening level until one fits under max_results
-                    result = None
-                    used_level = None
+                    found_level = False
                     for level_label, level_mode in tighten_levels:
                         tightened_q = _apply_field_restrictions(raw_q, level_mode)
-                        # Check count first via cache or API
                         cached_result = query_cache.get(tightened_q)
-                        if cached_result:
-                            count = cached_result.result_count
-                        else:
-                            count = pubmed.count_results(tightened_q)
+                        count = cached_result.result_count if cached_result else pubmed.count_results(tightened_q)
 
                         if count <= max_results:
-                            result = fetch_or_cached(
-                                tightened_q,
-                                label,
-                                max_count=max_results,
-                                known_count=count,
-                                advance_step=False,
-                            )
-                            used_level = level_label
+                            eligible.append((tightened_q, level_label, count))
+                            per_query.append({
+                                "query": tightened_q,
+                                "skipped": False,
+                                "result_count": count,
+                                "field_level": level_label,
+                            })
+                            if level_label != configured_mode:
+                                tightened_count += 1
+                                log.print(
+                                    f"[dim]  {label}: auto-tightened to [{level_label}] "
+                                    f"({count:,} results)[/dim]"
+                                )
+                            found_level = True
                             break
                         else:
                             log.print(
@@ -1617,52 +1620,57 @@ def run_study(
                                 f"(> {max_results:,}), tightening...[/dim]"
                             )
 
-                    if result is None:
+                    if not found_level:
                         skipped += 1
                         per_query.append({
                             "query": raw_q,
                             "skipped": True,
                             "reason": "too_broad",
                         })
-                        continue
 
-                    if used_level and used_level != configured_mode:
-                        tightened_count += 1
-                        log.print(
-                            f"[dim]  {label}: auto-tightened to [{used_level}] "
-                            f"({result.result_count:,} results)[/dim]"
-                        )
+                # Phase 2: Union eligible queries and fetch once
+                if eligible:
+                    if len(eligible) == 1:
+                        union_query = eligible[0][0]
+                        union_label = "Block-drop (1 query)"
+                    else:
+                        union_query = " OR ".join(f"({q})" for q, _, _ in eligible)
+                        union_label = f"Block-drop union ({len(eligible)} queries)"
 
-                    pmids = set(result.pmid_map.keys())
-                    new_pmids = pmids - before_pmids
-                    dup_pmids = pmids & before_pmids
-                    new_dois = set(result.doi_map.keys()) - before_dois
+                    progress.update(
+                        task_id,
+                        description=f"{union_label}: fetching...",
+                        splash=maybe_rotate_splash(),
+                    )
+                    # Use sum of individual counts as a generous max_count cap
+                    union_max = sum(c for _, _, c in eligible)
+                    result = fetch_or_cached(
+                        union_query,
+                        union_label,
+                        max_count=max(union_max, max_results),
+                        advance_step=False,
+                    )
 
-                    for pmid, info in result.pmid_map.items():
-                        if pmid not in llm_results.pmid_map:
-                            llm_results.pmid_map[pmid] = info
-                    for doi, info in result.doi_map.items():
-                        if doi not in llm_results.doi_map:
-                            llm_results.doi_map[doi] = info
+                    if result:
+                        pmids = set(result.pmid_map.keys())
+                        new_pmids = pmids - before_pmids
+                        dup_pmids = pmids & before_pmids
+                        new_dois = set(result.doi_map.keys()) - before_dois
 
-                    llm_results.result_count += len(new_pmids)
-                    before_pmids |= new_pmids
-                    before_dois |= new_dois
+                        for pmid, info in result.pmid_map.items():
+                            if pmid not in llm_results.pmid_map:
+                                llm_results.pmid_map[pmid] = info
+                        for doi, info in result.doi_map.items():
+                            if doi not in llm_results.doi_map:
+                                llm_results.doi_map[doi] = info
 
-                    total_new_pmids += len(new_pmids)
-                    total_dup_pmids += len(dup_pmids)
-                    total_new_dois += len(new_dois)
+                        llm_results.result_count += len(new_pmids)
+                        before_pmids |= new_pmids
+                        before_dois |= new_dois
 
-                    per_query.append({
-                        "query": result.query if hasattr(result, 'query') else raw_q,
-                        "skipped": False,
-                        "result_count": result.result_count,
-                        "total_pmids": len(pmids),
-                        "new_pmids": len(new_pmids),
-                        "dup_pmids": len(dup_pmids),
-                        "new_dois": len(new_dois),
-                        "field_level": used_level,
-                    })
+                        total_new_pmids += len(new_pmids)
+                        total_dup_pmids += len(dup_pmids)
+                        total_new_dois += len(new_dois)
 
                 found_after = count_found_studies(llm_results, eval_included_studies)
                 delta_found = found_after - found_before
