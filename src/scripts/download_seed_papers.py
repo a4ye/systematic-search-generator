@@ -215,9 +215,10 @@ def process_review(review_dir: Path) -> dict:
 
         # Clean PMID
         if pd.notna(pmid):
-            pmid = str(pmid).strip()
-            # Handle various formats
-            pmid = re.sub(r"[^\d]", "", pmid)
+            try:
+                pmid = str(int(float(pmid)))
+            except (ValueError, OverflowError):
+                pmid = re.sub(r"[^\d]", "", str(pmid).strip())
             if not pmid:
                 pmid = None
         else:
