@@ -280,7 +280,11 @@ def fetch_similar_pmids(
         rate_delay: float,
         per_seed: int,
 ) -> dict[str, list[str]]:
-    """Fetch similar articles from PubMed for each seed PMID."""
+    """Fetch similar articles from PubMed for each seed PMID.
+
+    Uses concurrent elink calls (one per PMID) to overlap network latency
+    while respecting the Entrez rate limit.
+    """
     if not seed_pmids or per_seed <= 0:
         return {}
 
@@ -288,9 +292,21 @@ def fetch_similar_pmids(
     if api_key:
         Entrez.api_key = api_key
 
-    results: dict[str, list[str]] = {}
-    for pmid in seed_pmids:
-        time.sleep(rate_delay)
+    import threading
+    _rate_lock = threading.Lock()
+    _last_request_time = 0.0
+
+    def _rate_wait():
+        nonlocal _last_request_time
+        with _rate_lock:
+            now = time.time()
+            elapsed = now - _last_request_time
+            if elapsed < rate_delay:
+                time.sleep(rate_delay - elapsed)
+            _last_request_time = time.time()
+
+    def _fetch_one(pmid: str) -> tuple[str, list[str]]:
+        _rate_wait()
         handle = Entrez.elink(
             dbfrom="pubmed",
             db="pubmed",
@@ -305,8 +321,7 @@ def fetch_similar_pmids(
 
         pmids: list[str] = []
         try:
-            linksets = record or []
-            for linkset in linksets:
+            for linkset in (record or []):
                 for db in linkset.get("LinkSetDb", []):
                     for link in db.get("Link", []):
                         pid = link.get("Id")
@@ -314,9 +329,17 @@ def fetch_similar_pmids(
                             pmids.append(str(pid))
         except Exception:
             pmids = []
+        return pmid, pmids[:per_seed]
 
-        if pmids:
-            results[pmid] = pmids[:per_seed]
+    results: dict[str, list[str]] = {}
+    max_workers = 8 if api_key else 2
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, pmid): pmid for pmid in seed_pmids}
+        for future in as_completed(futures):
+            pmid, pmids = future.result()
+            if pmids:
+                results[pmid] = pmids
 
     return results
 
@@ -1459,16 +1482,16 @@ def run_study(
                     )
 
                     if not supplement_query:
-                        log.print("[yellow]Supplement query was empty; stopping[/yellow]")
+                        log.print("[yellow]Supplement query was empty; continuing[/yellow]")
                         progress.advance(task_id, 1)
-                        break
+                        continue
 
                     supplement_results = fetch_or_cached(
                         supplement_query,
                         f"Supplement query {passes_run}",
                     )
                     if supplement_results is None:
-                        log.print("[yellow]Supplement query produced no results; stopping[/yellow]")
+                        log.print("[yellow]Supplement query produced no results; continuing[/yellow]")
                         pass_stats.append({
                             "pass": passes_run,
                             "missed_seed_count": len(missed_seed_papers),
@@ -1477,7 +1500,7 @@ def run_study(
                             "new_pmids": 0,
                             "dup_pmids": 0,
                         })
-                        break
+                        continue
 
                     before_pmids = set(llm_results.pmid_map.keys())
                     before_dois = set(llm_results.doi_map.keys())
@@ -1642,14 +1665,29 @@ def run_study(
                         description=f"{union_label}: fetching...",
                         splash=maybe_rotate_splash(),
                     )
-                    # Use sum of individual counts as a generous max_count cap
+                    # Sum of individual counts is the upper bound on union size.
+                    # Must pass this as max_results to execute_query_fast so we
+                    # don't truncate results that individual fetches would have caught.
                     union_max = sum(c for _, _, c in eligible)
-                    result = fetch_or_cached(
-                        union_query,
-                        union_label,
-                        max_count=max(union_max, max_results),
-                        advance_step=False,
-                    )
+
+                    # Check cache first
+                    cached_union = query_cache.get(union_query)
+                    if cached_union:
+                        result = PubMedSearchResults.from_cached(
+                            query=union_query,
+                            pmids=cached_union.pmids,
+                            result_count=cached_union.result_count,
+                            doi_to_pmid=cached_union.doi_to_pmid,
+                        )
+                    else:
+                        result = pubmed.execute_query_fast(
+                            union_query,
+                            max_results=max(union_max, config.max_pubmed_results),
+                        )
+                        # Cache the union result
+                        _pmids = list(result.pmid_map.keys())
+                        _doi_to_pmid = {doi: info["pmid"] for doi, info in result.doi_map.items()}
+                        query_cache.set(union_query, _pmids, result.result_count, _doi_to_pmid)
 
                     if result:
                         pmids = set(result.pmid_map.keys())
@@ -1864,108 +1902,129 @@ def run_study(
             doi_resolved_pmids: list[str] = []  # PMIDs resolved from DOI-only seeds
 
             if depth == 1:
-                # Simple path: use get_citations which returns from cache immediately
-                for sp in seed_papers:
+                # Parallel path: fetch citations for all seed papers concurrently
+
+                def _fetch_seed_citations_d1(sp):
+                    """Fetch citations for one seed paper (depth 1). Thread-safe."""
                     sp_pmid = sp.get("pmid")
                     sp_doi = sp.get("doi")
                     if not sp_pmid and not sp_doi:
-                        seed_no_id.append(sp.get("title") or "unknown title")
-                        continue
+                        return {"no_id": sp.get("title") or "unknown title"}
                     if sp_pmid:
-                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
                         cr = oa_client.get_citations(
-                            sp_pmid,
-                            cache=citation_cache,
-                            max_forward=2000,
+                            sp_pmid, cache=citation_cache, max_forward=2000,
                         )
-                        if not cr.forward_pmids and not cr.backward_pmids:
-                            seed_not_found_openalex.append(sp_pmid)
-                        citation_pmids |= cr.all_pmids
-                        log.print(
-                            f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
-                            f"{len(cr.backward_pmids)} backward[/dim]"
-                        )
+                        return {"pmid": sp_pmid, "cr": cr}
                     else:
-                        # DOI-only seed: look up via DOI
-                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
                         cr, resolved_pmid = oa_client.get_citations_by_doi(
-                            sp_doi,
-                            cache=citation_cache,
-                            max_forward=2000,
+                            sp_doi, cache=citation_cache, max_forward=2000,
                         )
-                        if not cr.forward_pmids and not cr.backward_pmids:
-                            seed_not_found_openalex.append(f"doi:{sp_doi}")
-                        citation_pmids |= cr.all_pmids
-                        label = f"DOI {sp_doi}"
-                        if resolved_pmid:
-                            label += f" (PMID {resolved_pmid})"
-                            doi_resolved_pmids.append(resolved_pmid)
-                            seed_pmids.append(resolved_pmid)
-                        else:
-                            seed_missing_pmid.append(sp.get("title") or sp_doi)
-                        log.print(
-                            f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
-                            f"{len(cr.backward_pmids)} backward[/dim]"
-                        )
+                        return {"doi": sp_doi, "cr": cr, "resolved_pmid": resolved_pmid, "title": sp.get("title")}
+
+                progress.update(task_id, description=f"Citations for {len(seed_papers)} seeds (parallel)...", splash=maybe_rotate_splash())
+                with ThreadPoolExecutor(max_workers=5) as cite_executor:
+                    futures = {cite_executor.submit(_fetch_seed_citations_d1, sp): sp for sp in seed_papers}
+                    for future in as_completed(futures):
+                        res = future.result()
+                        if "no_id" in res:
+                            seed_no_id.append(res["no_id"])
+                        elif "pmid" in res:
+                            cr = res["cr"]
+                            if not cr.forward_pmids and not cr.backward_pmids:
+                                seed_not_found_openalex.append(res["pmid"])
+                            citation_pmids |= cr.all_pmids
+                            log.print(
+                                f"[dim]  PMID {res['pmid']}: {len(cr.forward_pmids)} forward, "
+                                f"{len(cr.backward_pmids)} backward[/dim]"
+                            )
+                        elif "doi" in res:
+                            cr = res["cr"]
+                            resolved_pmid = res.get("resolved_pmid")
+                            if not cr.forward_pmids and not cr.backward_pmids:
+                                seed_not_found_openalex.append(f"doi:{res['doi']}")
+                            citation_pmids |= cr.all_pmids
+                            label = f"DOI {res['doi']}"
+                            if resolved_pmid:
+                                label += f" (PMID {resolved_pmid})"
+                                doi_resolved_pmids.append(resolved_pmid)
+                                seed_pmids.append(resolved_pmid)
+                            else:
+                                seed_missing_pmid.append(res.get("title") or res["doi"])
+                            log.print(
+                                f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
+                                f"{len(cr.backward_pmids)} backward[/dim]"
+                            )
             else:
-                # Depth > 1: need work IDs for frontier expansion
+                # Depth > 1: need work IDs for frontier expansion (parallel)
+
                 frontier_ids: set[str] = set()
                 visited_ids: set[str] = set()
-                for sp in seed_papers:
+
+                def _fetch_seed_citations_d2(sp):
+                    """Fetch citations + work IDs for one seed paper (depth > 1). Thread-safe."""
                     sp_pmid = sp.get("pmid")
                     sp_doi = sp.get("doi")
                     if not sp_pmid and not sp_doi:
-                        seed_no_id.append(sp.get("title") or "unknown title")
-                        continue
+                        return {"no_id": sp.get("title") or "unknown title"}
                     if sp_pmid:
-                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
                         cr, work_ids, found = oa_client.get_citations_with_work_ids(
-                            sp_pmid,
-                            cache=citation_cache,
-                            direction=direction,
+                            sp_pmid, cache=citation_cache, direction=direction,
                         )
-                        if not found:
-                            seed_not_found_openalex.append(sp_pmid)
-                        citation_pmids |= cr.all_pmids
-                        for wid in work_ids:
-                            if wid:
-                                frontier_ids.add(wid)
-                                visited_ids.add(wid)
-                        log.print(
-                            f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
-                            f"{len(cr.backward_pmids)} backward[/dim]"
-                        )
+                        return {"pmid": sp_pmid, "cr": cr, "work_ids": work_ids, "found": found}
                     else:
-                        # DOI-only seed: look up via DOI
-                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
                         cr, work_ids, found, resolved_pmid = oa_client.get_citations_with_work_ids_by_doi(
-                            sp_doi,
-                            cache=citation_cache,
-                            direction=direction,
+                            sp_doi, cache=citation_cache, direction=direction,
                         )
-                        if not found:
-                            seed_not_found_openalex.append(f"doi:{sp_doi}")
-                        citation_pmids |= cr.all_pmids
-                        for wid in work_ids:
-                            if wid:
-                                frontier_ids.add(wid)
-                                visited_ids.add(wid)
-                        label = f"DOI {sp_doi}"
-                        if resolved_pmid:
-                            label += f" (PMID {resolved_pmid})"
-                            doi_resolved_pmids.append(resolved_pmid)
-                            seed_pmids.append(resolved_pmid)
-                        else:
-                            seed_missing_pmid.append(sp.get("title") or sp_doi)
-                        log.print(
-                            f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
-                            f"{len(cr.backward_pmids)} backward[/dim]"
-                        )
+                        return {"doi": sp_doi, "cr": cr, "work_ids": work_ids, "found": found,
+                                "resolved_pmid": resolved_pmid, "title": sp.get("title")}
 
+                progress.update(task_id, description=f"Citations for {len(seed_papers)} seeds (parallel)...", splash=maybe_rotate_splash())
+                with ThreadPoolExecutor(max_workers=5) as cite_executor:
+                    futures = {cite_executor.submit(_fetch_seed_citations_d2, sp): sp for sp in seed_papers}
+                    for future in as_completed(futures):
+                        res = future.result()
+                        if "no_id" in res:
+                            seed_no_id.append(res["no_id"])
+                        elif "pmid" in res:
+                            cr = res["cr"]
+                            if not res["found"]:
+                                seed_not_found_openalex.append(res["pmid"])
+                            citation_pmids |= cr.all_pmids
+                            for wid in res["work_ids"]:
+                                if wid:
+                                    frontier_ids.add(wid)
+                                    visited_ids.add(wid)
+                            log.print(
+                                f"[dim]  PMID {res['pmid']}: {len(cr.forward_pmids)} forward, "
+                                f"{len(cr.backward_pmids)} backward[/dim]"
+                            )
+                        elif "doi" in res:
+                            cr = res["cr"]
+                            resolved_pmid = res.get("resolved_pmid")
+                            if not res["found"]:
+                                seed_not_found_openalex.append(f"doi:{res['doi']}")
+                            citation_pmids |= cr.all_pmids
+                            for wid in res["work_ids"]:
+                                if wid:
+                                    frontier_ids.add(wid)
+                                    visited_ids.add(wid)
+                            label = f"DOI {res['doi']}"
+                            if resolved_pmid:
+                                label += f" (PMID {resolved_pmid})"
+                                doi_resolved_pmids.append(resolved_pmid)
+                                seed_pmids.append(resolved_pmid)
+                            else:
+                                seed_missing_pmid.append(res.get("title") or res["doi"])
+                            log.print(
+                                f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
+                                f"{len(cr.backward_pmids)} backward[/dim]"
+                            )
+
+                # Frontier expansion at depth > 1 (parallel)
                 for level in range(2, depth + 1):
                     if not frontier_ids:
                         break
-                    progress.update(task_id, description=f"Citations depth {level}...", splash=maybe_rotate_splash())
+                    progress.update(task_id, description=f"Citations depth {level} ({len(frontier_ids)} works, parallel)...", splash=maybe_rotate_splash())
                     next_frontier: set[str] = set()
                     frontier_list = sorted(frontier_ids)
                     if max_frontier > 0 and len(frontier_list) > max_frontier:
@@ -1973,16 +2032,19 @@ def run_study(
                         log.print(
                             f"[dim]  Depth {level}: capped frontier to {len(frontier_list)} works[/dim]"
                         )
-                    for oa_id in frontier_list:
-                        pmids, work_ids = oa_client.get_citations_for_work_id(
-                            oa_id,
-                            direction=direction,
-                        )
-                        citation_pmids |= pmids
-                        for wid in work_ids:
-                            if wid and wid not in visited_ids:
-                                visited_ids.add(wid)
-                                next_frontier.add(wid)
+
+                    def _fetch_frontier(oa_id):
+                        return oa_client.get_citations_for_work_id(oa_id, direction=direction)
+
+                    with ThreadPoolExecutor(max_workers=5) as frontier_executor:
+                        frontier_futures = {frontier_executor.submit(_fetch_frontier, oa_id): oa_id for oa_id in frontier_list}
+                        for future in as_completed(frontier_futures):
+                            pmids, work_ids = future.result()
+                            citation_pmids |= pmids
+                            for wid in work_ids:
+                                if wid and wid not in visited_ids:
+                                    visited_ids.add(wid)
+                                    next_frontier.add(wid)
                     if not next_frontier:
                         break
                     frontier_ids = next_frontier

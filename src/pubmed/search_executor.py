@@ -295,10 +295,34 @@ class PubMedExecutor:
                 handle.close()
             return summaries
 
-        completed_batches = 0
-        for start in range(0, len(id_list), self.batch_size):
-            time.sleep(self.rate_limit_delay)
+        # Fetch batches concurrently to overlap network round-trips.
+        # PubMed allows 10 req/sec with API key, 3/sec without.
+        # A threading lock tracks the last request time to enforce the
+        # minimum interval between requests, even when batches return fast.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
 
+        max_workers = 8 if self.rate_limit_delay <= 0.15 else 3
+        batch_starts = list(range(0, len(id_list), self.batch_size))
+        completed_batches = 0
+
+        # Rate limiter: enforce minimum interval between request starts
+        _rate_lock = threading.Lock()
+        _last_request_time = 0.0
+
+        def _rate_wait():
+            """Block until enough time has passed since the last request."""
+            nonlocal _last_request_time
+            with _rate_lock:
+                now = time.time()
+                elapsed = now - _last_request_time
+                if elapsed < self.rate_limit_delay:
+                    time.sleep(self.rate_limit_delay - elapsed)
+                _last_request_time = time.time()
+
+        def _fetch_and_parse(start):
+            """Fetch one batch and extract DOIs. Returns list of (pmid, doi) pairs."""
+            _rate_wait()
             summaries = self._entrez_call_with_retry(
                 _fetch_summaries,
                 start=start,
@@ -306,24 +330,28 @@ class PubMedExecutor:
                 webenv=webenv,
                 query_key=query_key,
             )
-
-            # Extract DOIs from summaries
+            pairs = []
             for summary in summaries:
                 if isinstance(summary, dict):
                     pmid = str(summary.get("Id", ""))
-                    # DOI can be in ArticleIds or elocationid
                     article_ids = summary.get("ArticleIds", {})
                     doi = article_ids.get("doi", "")
                     if not doi:
-                        # Try elocationid field
                         eloc = summary.get("elocationid", "")
                         if eloc and eloc.startswith("doi:"):
                             doi = eloc[4:].strip()
                     if pmid and doi:
-                        pmid_to_doi[pmid] = _normalize_doi(doi)
-            completed_batches += 1
-            if progress_callback and total_batches:
-                progress_callback(completed_batches, total_batches)
+                        pairs.append((pmid, _normalize_doi(doi)))
+            return pairs
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_and_parse, s): s for s in batch_starts}
+            for future in as_completed(futures):
+                for pmid, doi in future.result():
+                    pmid_to_doi[pmid] = doi
+                completed_batches += 1
+                if progress_callback and total_batches:
+                    progress_callback(completed_batches, total_batches)
 
         execution_time = time.time() - start_time
 
