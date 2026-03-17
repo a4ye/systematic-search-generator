@@ -133,14 +133,14 @@ uv run python -m src.generate_query protocol.pdf \
   --similar-augment 100 --similar-augment-sample 20
 ```
 
-From testing, these parameters were found to yield the best recall results while keeping result counts manageable. There probably exists a better parameter configuration that would yield even higher recall, but finding it would be quite time consuming. It is recommended to use the above parameters for general use.
+From testing, these parameters were found to yield the best recall results while keeping result counts manageable. There may exist a better parameter configuration that would yield even higher recall with reasonable results returned, but finding it could be quite time consuming. It is recommended to use the above parameters for general use.
 
 Results across 11 systematic reviews (studies 34, 43, 76, 88, 92, 101, 110, 118, 131, 143), with 5 randomly selected seed papers per review:
 
-|  | Mean PubMed Recall | Mean Results Returned |
-|--|-------------------:|----------------------:|
-| **LLM-generated query** | **97.8%** | 17,621 |
-| Human query | 92.9% | 1,805 |
+|  |     Mean PubMed Recall | Mean Results Returned |
+|--|-----------------------:|----------------------:|
+| **LLM-generated query** |  **97.8%**, stdev 1.1% | 17,621 |
+| Human query |                  92.9% | 1,805 |
 
 The LLM-generated queries average a 2.2% miss rate compared to the human average of 7.1%, a 69% reduction in errors. Put differently, human queries make 3.2x more mistakes than the LLM-generated queries on this benchmark set.
 
