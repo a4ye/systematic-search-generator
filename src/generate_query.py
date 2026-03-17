@@ -1,7 +1,6 @@
-"""Generate a PubMed query from a PROSPERO PDF using a single-shot prompt, then evaluate it."""
+"""Generate a PubMed systematic review query from a PROSPERO PDF."""
 
 import argparse
-import json
 import math
 import random
 import re
@@ -15,15 +14,10 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.table import Table
 
 from Bio import Entrez, Medline
 
-from .cache.pubmed_index_cache import PubMedIndexCache
 from .cache.query_results_cache import QueryResultsCache
-from .compare_search import IncludedStudy, extract_included_studies
-from .discovery.study_finder import StudyFinder
-from .evaluation.metrics import EvaluationMetrics, calculate_metrics_with_pubmed_check, match_studies
 from .llm.openai_client import OpenAIClient
 from .mesh import MeshDB
 from .pipeline.config import PipelineConfig
@@ -118,39 +112,6 @@ Important:
 - If a field is not present in the document, write "Not specified".
 """
 
-SEED_PAPERS_DIR = Path("seed_papers")
-
-
-
-def load_seed_papers(study_id: str, study_name: str, n: int) -> list[dict] | None:
-    """Load n random valid seed papers for a study.
-
-    Skips papers that are missing title and abstract (broken/empty entries).
-    Returns None if no seed paper file exists for this study.
-    """
-    # Try exact match first, then fallback to ID prefix
-    path = SEED_PAPERS_DIR / f"{study_id} - {study_name}.json"
-    if not path.exists():
-        matches = list(SEED_PAPERS_DIR.glob(f"{study_id} - *.json"))
-        if not matches:
-            return None
-        path = matches[0]
-
-    with open(path) as f:
-        data = json.load(f)
-
-    papers = data.get("papers", [])
-    # Filter out broken/empty entries
-    valid = [p for p in papers if p.get("title") and p.get("abstract")]
-    if not valid:
-        return None
-
-    if len(valid) <= n:
-        return valid
-
-    sampled = random.sample(valid, n)
-    return sampled
-
 
 # Mapping from single-letter codes to seed paper fields
 SEED_FIELD_CODES = {
@@ -159,6 +120,50 @@ SEED_FIELD_CODES = {
     "m": "mesh_terms",
     "k": "keywords",
 }
+
+
+def fetch_seed_papers_by_pmid(
+    pmids: list[str],
+    email: str,
+    api_key: str | None,
+    rate_delay: float,
+    batch_size: int = 200,
+) -> list[dict]:
+    """Fetch seed paper metadata from PubMed by PMID."""
+    if not pmids:
+        return []
+    Entrez.email = email
+    if api_key:
+        Entrez.api_key = api_key
+
+    papers = []
+    for start in range(0, len(pmids), batch_size):
+        batch = pmids[start:start + batch_size]
+        time.sleep(rate_delay)
+        handle = Entrez.efetch(db="pubmed", id=",".join(batch), rettype="medline", retmode="text")
+        try:
+            records = list(Medline.parse(handle))
+        finally:
+            handle.close()
+        for rec in records:
+            pmid = rec.get("PMID")
+            title = rec.get("TI", "")
+            abstract = rec.get("AB", "")
+            mesh_terms = rec.get("MH", [])
+            keywords = rec.get("OT", [])
+            dois = []
+            for aid in rec.get("AID", []):
+                if "[doi]" in aid:
+                    dois.append(aid.replace("[doi]", "").strip())
+            papers.append({
+                "pmid": pmid,
+                "title": title,
+                "abstract": abstract,
+                "mesh_terms": mesh_terms,
+                "keywords": keywords,
+                "doi": dois[0] if dois else None,
+            })
+    return papers
 
 
 def format_seed_papers(papers: list[dict], fields: str = "tamk") -> str:
@@ -185,7 +190,6 @@ def format_seed_papers(papers: list[dict], fields: str = "tamk") -> str:
             lines.append(f"  Keywords: {', '.join(p['keywords'])}")
         lines.append("")
     return "\n".join(lines)
-
 
 
 # ---------------------------------------------------------------------------
@@ -301,23 +305,6 @@ def fetch_similar_pmids(
     return results
 
 
-def count_found_studies(
-        search_results: PubMedSearchResults,
-        included_studies: list[IncludedStudy],
-) -> int:
-    """Count how many included studies match the search results."""
-    found = 0
-    for study in included_studies:
-        match = None
-        if study.doi:
-            match = search_results.match_by_doi(study.doi)
-        if not match and study.pmid:
-            match = search_results.match_by_pmid(study.pmid)
-        if match:
-            found += 1
-    return found
-
-
 def get_missed_seed_papers(
         seed_papers: list[dict],
         search_results: PubMedSearchResults,
@@ -344,39 +331,6 @@ def get_missed_seed_papers(
         if not matched:
             missed.append(sp)
     return missed, unchecked
-
-
-def merge_seed_papers_into_included(
-        included_studies: list[IncludedStudy],
-        seed_papers: list[dict] | None,
-) -> tuple[list[IncludedStudy], int]:
-    """Merge seed papers into included studies for evaluation."""
-    if not seed_papers:
-        return included_studies, 0
-    existing_pmids = {s.pmid for s in included_studies if s.pmid}
-    existing_dois = {s.doi for s in included_studies if s.doi}
-    merged = list(included_studies)
-    added = 0
-    for sp in seed_papers:
-        pmid = sp.get("pmid")
-        doi = sp.get("doi")
-        if pmid:
-            pmid = str(pmid).strip()
-        if doi:
-            doi = re.sub(r"^https?://doi\\.org/", "", str(doi), flags=re.IGNORECASE).lower()
-        if not pmid and not doi:
-            continue
-        if pmid and pmid in existing_pmids:
-            continue
-        if doi and doi in existing_dois:
-            continue
-        merged.append(IncludedStudy(doi=doi, pmid=pmid, title=sp.get("title")))
-        if pmid:
-            existing_pmids.add(pmid)
-        if doi:
-            existing_dois.add(doi)
-        added += 1
-    return merged, added
 
 
 _MESH_TERM_RE = re.compile(r"\"([^\"]+)\"\[(?:MeSH|Mesh)\]")
@@ -586,86 +540,18 @@ def build_tfidf_query(terms: list[str], field: str = "tiab", joiner: str = "OR")
     return "(" + f" {joiner_norm} ".join(formatted) + ")"
 
 
-# ── End configuration ────────────────────────────────────────────────────────
-
-
-@dataclass
-class StudyResult:
-    """Results from running the pipeline on a single study."""
-
-    study_id: str
-    study_name: str
-    llm_metrics: object  # MetricsResult
-    human_metrics: object | None  # MetricsResult or None
-    llm_queries: list[str] | None = None
-    merged_query: str | None = None
-    executed_query: str | None = None
-    human_query: str | None = None
-    query_prompt: str | None = None
-    missed_papers: list[dict] | None = None
-    citation_stats: dict | None = None  # {total, new, hits}
-    supplement_query: str | None = None
-    supplement_stats: dict | None = None
-    similar_stats: dict | None = None
-    similar_augment_stats: dict | None = None
-    mesh_entry_stats: dict | None = None
-    tfidf_query: str | None = None
-    tfidf_stats: dict | None = None
-    block_drop_stats: dict | None = None
-    error: str | None = None
-
-
-def _calculate_total_steps(
-        n_runs: int,
-        include_human: bool,
-        two_pass: bool,
-        similar: bool,
-        similar_augment: bool,
-        tfidf: bool,
-        block_drop: bool,
-        two_pass_max: int,
-) -> int:
-    """Calculate the total number of progress steps for a study pipeline.
-
-    Steps:
-      1. Load included studies
-      2. Extract plan from PDF
-      3. Generate N queries (n_runs steps)
-      4. Fetch PubMed results for N queries (n_runs steps)
-      5. Evaluate LLM metrics
-      6-8. (if human) Extract/load strategy, fetch PubMed, evaluate metrics
-    """
-    total = 2 + n_runs + 1 + 1  # load + extract + generate(n) + fetch(1) + evaluate
-    if two_pass:
-        total += 2 * max(1, two_pass_max)  # supplement LLM + supplement fetch (max passes)
-    if similar:
-        total += 1  # similar articles fetch
-    if similar_augment:
-        total += 1  # similar articles round 2 (augmentation hits)
-    if tfidf:
-        total += 1  # TF-IDF supplemental query
-    if block_drop:
-        total += 1  # block-drop supplemental queries
-    if include_human:
-        total += 3  # strategy extract + fetch + evaluate
-    return total
+# ── Query parsing utilities ─────────────────────────────────────────────────
 
 
 def extract_query_from_response(text: str) -> str:
-    """Extract the PubMed query from an LLM response.
-
-    Handles responses that include explanation text, code fences, etc.
-    """
-    # Strip code fences
+    """Extract the PubMed query from an LLM response."""
     text = re.sub(r"```(?:\w+)?\n?", "", text).strip()
 
-    # If the response contains a line starting with (, that's likely the query
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("(") and "[" in line:
             return line
 
-    # Otherwise return the longest line containing boolean operators
     candidates = []
     for line in text.splitlines():
         line = line.strip()
@@ -675,12 +561,10 @@ def extract_query_from_response(text: str) -> str:
     if candidates:
         return max(candidates, key=len)
 
-    # Fallback: return entire text stripped
     return text.strip()
 
 
 def _strip_outer_parens(text: str) -> str:
-    """Strip redundant outer parentheses from a query fragment."""
     s = text.strip()
     while s.startswith("(") and s.endswith(")"):
         depth = 0
@@ -700,7 +584,6 @@ def _strip_outer_parens(text: str) -> str:
 
 
 def _split_top_level(query: str, operator: str) -> list[str]:
-    """Split a query by a boolean operator at top level (not inside parens/quotes)."""
     token = f" {operator.strip().upper()} "
     if not token.strip():
         return [query.strip()]
@@ -732,7 +615,6 @@ def _split_top_level(query: str, operator: str) -> list[str]:
 
 
 def _apply_field_restrictions(query: str, mode: str) -> str:
-    """Apply field-tightening to a query (e.g., [tiab]->[ti], [Mesh]->[Majr])."""
     mode_norm = (mode or "none").lower()
     if mode_norm in ("none", "off", "false", "0"):
         return query
@@ -745,13 +627,10 @@ def _apply_field_restrictions(query: str, mode: str) -> str:
 
 
 def build_block_drop_queries(query: str, field_mode: str = "ti") -> list[str]:
-    """Create block-drop supplemental queries by removing one top-level AND block."""
     if not query:
         return []
-
     top_or_parts = _split_top_level(query, "OR")
     candidates: list[str] = []
-
     for part in top_or_parts:
         part_core = _strip_outer_parens(part)
         and_blocks = _split_top_level(part_core, "AND")
@@ -767,8 +646,6 @@ def build_block_drop_queries(query: str, field_mode: str = "ti") -> list[str]:
                 candidate = f"({candidate})"
             candidate = _apply_field_restrictions(candidate, field_mode)
             candidates.append(candidate)
-
-    # Dedupe while preserving order
     unique: list[str] = []
     seen = set()
     for c in candidates:
@@ -781,8 +658,6 @@ def build_block_drop_queries(query: str, field_mode: str = "ti") -> list[str]:
     return unique
 
 
-# Ordered tightening levels for block-drop auto-tightening.
-# Each is a (label, field_mode) tuple applied to the *raw* candidate.
 _TIGHTEN_LEVELS: list[tuple[str, str]] = [
     ("ti", "ti"),
     ("ti+majr", "ti+majr"),
@@ -790,13 +665,10 @@ _TIGHTEN_LEVELS: list[tuple[str, str]] = [
 
 
 def build_block_drop_candidates_raw(query: str) -> list[str]:
-    """Create raw block-drop candidates without field restrictions (for auto-tightening)."""
     if not query:
         return []
-
     top_or_parts = _split_top_level(query, "OR")
     candidates: list[str] = []
-
     for part in top_or_parts:
         part_core = _strip_outer_parens(part)
         and_blocks = _split_top_level(part_core, "AND")
@@ -811,8 +683,6 @@ def build_block_drop_candidates_raw(query: str) -> list[str]:
             if len(remaining) > 1:
                 candidate = f"({candidate})"
             candidates.append(candidate)
-
-    # Dedupe while preserving order
     unique: list[str] = []
     seen = set()
     for c in candidates:
@@ -825,280 +695,71 @@ def build_block_drop_candidates_raw(query: str) -> list[str]:
     return unique
 
 
-def print_study_table(
-        console: Console,
-        llm_metrics: EvaluationMetrics,
-        human_metrics: EvaluationMetrics | None,
-        allow_float_counts: bool = False,
-        title: str | None = None,
-):
-    """Print the comparison table."""
-    m = llm_metrics
-    h = human_metrics
-
-    count_decimals = 1 if allow_float_counts else 0
-
-    def fmt_count(val: float) -> str:
-        if allow_float_counts:
-            return f"{val:.1f}"
-        return f"{int(val)}"
-
-    def fmt_diff_count(gen_val, human_val, higher_is_better=True):
-        if h is None:
-            return "[dim]—[/dim]"
-        diff = gen_val - human_val
-        if human_val != 0:
-            pct = (diff / human_val) * 100
-            if allow_float_counts:
-                s = f"{diff:+.{count_decimals}f} ({pct:+.0f}%)"
-            else:
-                s = f"{diff:+d} ({pct:+.0f}%)"
-        else:
-            s = f"{diff:+.{count_decimals}f}" if allow_float_counts else f"{diff:+d}"
-        if (diff > 0 and higher_is_better) or (diff < 0 and not higher_is_better):
-            return f"[green]{s}[/green]"
-        elif (diff < 0 and higher_is_better) or (diff > 0 and not higher_is_better):
-            return f"[red]{s}[/red]"
-        return s
-
-    def fmt_diff_pct(gen_val, human_val, higher_is_better=True):
-        if h is None:
-            return "[dim]—[/dim]"
-        diff = gen_val - human_val
-        s = f"{diff * 100:+.1f}%"
-        if (diff > 0 and higher_is_better) or (diff < 0 and not higher_is_better):
-            return f"[green]{s}[/green]"
-        elif (diff < 0 and higher_is_better) or (diff > 0 and not higher_is_better):
-            return f"[red]{s}[/red]"
-        return s
-
-    def fmt_diff_float(gen_val, human_val, higher_is_better=True):
-        if h is None:
-            return "[dim]—[/dim]"
-        if gen_val == float("inf") or human_val == float("inf"):
-            return "[dim]—[/dim]"
-        diff = gen_val - human_val
-        if human_val != 0:
-            pct = (diff / human_val) * 100
-            s = f"{diff:+.1f} ({pct:+.0f}%)"
-        else:
-            s = f"{diff:+.1f}"
-        if (diff > 0 and higher_is_better) or (diff < 0 and not higher_is_better):
-            return f"[green]{s}[/green]"
-        elif (diff < 0 and higher_is_better) or (diff > 0 and not higher_is_better):
-            return f"[red]{s}[/red]"
-        return s
-
-    na = "[dim]—[/dim]"
-
-    if title:
-        console.print(f"[bold]{title}[/bold]")
-
-    console.print(f"Included studies:       {m.total_included}")
-    console.print(f"Not indexed in PubMed:  {m.not_in_pubmed}")
-    console.print(f"PubMed-indexed:         {m.pubmed_indexed_count}")
-    console.print()
-
-    table = Table(show_header=True, header_style="bold")
-    table.add_column("Metric", style="dim", width=22)
-    table.add_column("Generated", justify="right", width=18)
-    table.add_column("Human", justify="right", width=18)
-    table.add_column("Diff", justify="right", width=18)
-
-    table.add_row(
-        "Search results",
-        fmt_count(m.total_results),
-        fmt_count(h.total_results) if h else na,
-        fmt_diff_count(m.total_results, h.total_results, higher_is_better=False) if h else na,
-    )
-    table.add_row(
-        "Captured",
-        f"{fmt_count(m.found_pubmed)} / {fmt_count(m.pubmed_indexed_count)}",
-        f"{fmt_count(h.found_pubmed)} / {fmt_count(h.pubmed_indexed_count)}" if h else na,
-        fmt_diff_count(m.found, h.found) if h else na,
-    )
-    table.add_row(
-        "Missed (in PubMed)",
-        fmt_count(m.missed_pubmed_indexed),
-        fmt_count(h.missed_pubmed_indexed) if h else na,
-        fmt_diff_count(
-            m.missed_pubmed_indexed,
-            h.missed_pubmed_indexed,
-            higher_is_better=False,
-        )
-        if h
-        else na,
-    )
-    table.add_row(
-        "Recall (overall)",
-        f"{m.recall_overall * 100:.1f}%  ({fmt_count(m.found)}/{fmt_count(m.total_included)})",
-        f"{h.recall_overall * 100:.1f}%  ({fmt_count(h.found)}/{fmt_count(h.total_included)})" if h else na,
-        fmt_diff_pct(m.recall_overall, h.recall_overall) if h else na,
-    )
-    table.add_row(
-        "Recall (PubMed only)",
-        f"{m.recall_pubmed_only * 100:.1f}%  ({fmt_count(m.found_pubmed)}/{fmt_count(m.pubmed_indexed_count)})",
-        f"{h.recall_pubmed_only * 100:.1f}%  ({fmt_count(h.found_pubmed)}/{fmt_count(h.pubmed_indexed_count)})" if h else na,
-        fmt_diff_pct(m.recall_pubmed_only, h.recall_pubmed_only) if h else na,
-    )
-
-    precision_diff = fmt_diff_pct(m.precision, h.precision) if h else na
-    if h and h.precision > 0:
-        rel = m.precision / h.precision
-        color = "green" if rel >= 1.0 else "red"
-        precision_diff += f"  [{color}]{rel:.1f}x[/{color}]"
-
-    table.add_row(
-        "Precision",
-        f"{m.precision * 100:.2f}%  ({fmt_count(m.found)}/{fmt_count(m.total_results)})",
-        f"{h.precision * 100:.2f}%  ({fmt_count(h.found)}/{fmt_count(h.total_results)})" if h else na,
-        precision_diff,
-    )
-    table.add_row(
-        "NNR",
-        f"{m.nnr:.1f}",
-        f"{h.nnr:.1f}" if h else na,
-        fmt_diff_float(m.nnr, h.nnr, higher_is_better=False) if h else na,
-    )
-
-    console.print(table)
-    console.print()
+# ── Result dataclass ─────────────────────────────────────────────────────────
 
 
-def aggregate_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
-    """Aggregate metrics across multiple studies."""
-    total_results = sum(m.total_results for m in metrics_list)
-    total_included = sum(m.total_included for m in metrics_list)
-    found = sum(m.found for m in metrics_list)
-    found_pubmed = sum(m.found_pubmed for m in metrics_list)
-    not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list)
-    missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list)
-    missed = total_included - found
-    pubmed_indexed = total_included - not_in_pubmed
-
-    recall_overall = found / total_included if total_included > 0 else 0.0
-    recall_pubmed = found_pubmed / pubmed_indexed if pubmed_indexed > 0 else 0.0
-    precision = found / total_results if total_results > 0 else 0.0
-    nnr = total_results / found if found > 0 else float("inf")
-    if precision + recall_overall > 0:
-        f1 = 2 * (precision * recall_overall) / (precision + recall_overall)
-    else:
-        f1 = 0.0
-
-    return EvaluationMetrics(
-        total_results=total_results,
-        total_included=total_included,
-        found=found,
-        found_pubmed=found_pubmed,
-        missed=missed,
-        not_in_pubmed=not_in_pubmed,
-        missed_pubmed_indexed=missed_pubmed_indexed,
-        recall_overall=recall_overall,
-        recall_pubmed_only=recall_pubmed,
-        precision=precision,
-        nnr=nnr,
-        f1_score=f1,
-    )
+@dataclass
+class RunResult:
+    """Results from running the query generation pipeline."""
+    llm_queries: list[str]
+    merged_query: str | None
+    executed_query: str
+    final_pmid_map: dict[str, dict]
+    final_doi_map: dict[str, dict]
+    total_result_count: int
+    supplement_query: str | None = None
+    supplement_stats: dict | None = None
+    citation_stats: dict | None = None
+    similar_stats: dict | None = None
+    similar_augment_stats: dict | None = None
+    mesh_entry_stats: dict | None = None
+    tfidf_query: str | None = None
+    tfidf_stats: dict | None = None
+    block_drop_stats: dict | None = None
 
 
-def mean_metrics(metrics_list: list[EvaluationMetrics]) -> EvaluationMetrics:
-    """Compute simple mean of per-study metrics."""
-    n = len(metrics_list)
-    if n == 0:
-        return EvaluationMetrics(
-            total_results=0,
-            total_included=0,
-            found=0,
-            found_pubmed=0,
-            missed=0,
-            not_in_pubmed=0,
-            missed_pubmed_indexed=0,
-            recall_overall=0.0,
-            recall_pubmed_only=0.0,
-            precision=0.0,
-            nnr=float("inf"),
-            f1_score=0.0,
-        )
-
-    total_results = sum(m.total_results for m in metrics_list) / n
-    total_included = sum(m.total_included for m in metrics_list) / n
-    found = sum(m.found for m in metrics_list) / n
-    found_pubmed = sum(m.found_pubmed for m in metrics_list) / n
-    not_in_pubmed = sum(m.not_in_pubmed for m in metrics_list) / n
-    missed_pubmed_indexed = sum(m.missed_pubmed_indexed for m in metrics_list) / n
-    missed = total_included - found
-
-    recall_overall = sum(m.recall_overall for m in metrics_list) / n
-    recall_pubmed = sum(m.recall_pubmed_only for m in metrics_list) / n
-    precision = sum(m.precision for m in metrics_list) / n
-
-    finite_nnrs = [m.nnr for m in metrics_list if m.nnr != float("inf")]
-    nnr = sum(finite_nnrs) / len(finite_nnrs) if finite_nnrs else float("inf")
-
-    finite_f1 = [m.f1_score for m in metrics_list]
-    f1 = sum(finite_f1) / n
-
-    return EvaluationMetrics(
-        total_results=total_results,
-        total_included=total_included,
-        found=found,
-        found_pubmed=found_pubmed,
-        missed=missed,
-        not_in_pubmed=not_in_pubmed,
-        missed_pubmed_indexed=missed_pubmed_indexed,
-        recall_overall=recall_overall,
-        recall_pubmed_only=recall_pubmed,
-        precision=precision,
-        nnr=nnr,
-        f1_score=f1,
-    )
+def _calculate_total_steps(
+        n_runs: int,
+        two_pass: bool,
+        similar: bool,
+        similar_augment: bool,
+        tfidf: bool,
+        block_drop: bool,
+        two_pass_max: int,
+) -> int:
+    total = 1 + n_runs + 1  # extract plan + generate(n) + fetch(1)
+    if two_pass:
+        total += 2 * max(1, two_pass_max)
+    if similar:
+        total += 1
+    if similar_augment:
+        total += 1
+    if tfidf:
+        total += 1
+    if block_drop:
+        total += 1
+    return total
 
 
-def run_study(
-        study_id_arg: str,
+# ── Main pipeline ────────────────────────────────────────────────────────────
+
+
+def run_pipeline(
+        prospero_pdf: Path,
+        seed_papers: list[dict] | None,
         args: argparse.Namespace,
         config: PipelineConfig,
-        finder: StudyFinder,
         client: OpenAIClient,
         pubmed: PubMedExecutor,
-        index_cache: PubMedIndexCache,
         query_cache: QueryResultsCache,
         console: Console,
-) -> StudyResult | None:
-    """Run the full pipeline for a single study. Returns StudyResult or None on skip."""
+) -> RunResult | None:
+    """Run the full query generation pipeline. Returns RunResult or None on failure."""
     rate_delay = 0.1 if config.entrez_api_key else 0.34
 
-    study = finder.get_study(study_id_arg)
-    if not study:
-        console.print(f"[red]Study {study_id_arg} not found[/red]")
-        return None
-
-    if not study.prospero_pdf:
-        console.print(f"[red]Study {study_id_arg} has no PROSPERO PDF[/red]")
-        return None
-
-    console.print(f"\n[bold]Study: {study.study_id} - {study.name}[/bold]")
-
-    # Extract-only mode (no progress bar needed)
-    if args.extract:
-        console.print(f"\n[dim]Extracting plan with {MODEL}...[/dim]")
-        response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
-        console.print(
-            f"[dim]Tokens: {response.prompt_tokens} in / {response.completion_tokens} out, "
-            f"{response.generation_time:.1f}s[/dim]\n"
-        )
-        console.print(response.content, markup=False, highlight=False)
-        return None
-
-    if not study.included_studies_xlsx:
-        console.print(f"[red]Study {study_id_arg} has no included studies file[/red]")
-        return None
-
     n_runs = args.n
-    include_human = not args.no_human and study.search_strategy_docx is not None
     total_steps = _calculate_total_steps(
         n_runs,
-        include_human,
         args.two_pass,
         args.similar > 0,
         args.similar_augment > 0,
@@ -1119,29 +780,16 @@ def run_study(
     )
 
     with progress:
-        task_id = progress.add_task(
-            "Loading included studies...",
-            total=total_steps,
-
-        )
+        task_id = progress.add_task("Extracting plan...", total=total_steps)
         log = progress.console
         progress.refresh()
+
         def step(description: str) -> None:
             progress.update(task_id, description=description, advance=1)
 
-        # Load included studies
-        included_result = extract_included_studies(str(study.included_studies_xlsx))
-        step("Loading included studies")
-        if not included_result.is_valid:
-            log.print(f"[red]Error loading included studies: {included_result.error}[/red]")
-            return None
-
-        included_studies = included_result.studies
-        log.print(f"Included studies: {len(included_studies)}")
-
         # Step 1: Extract plan from PROSPERO PDF
         progress.update(task_id, description=f"Extracting plan with {MODEL}...")
-        extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
+        extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=prospero_pdf)
         step("Extracted plan")
         plan_info = extract_response.content
         log.print(
@@ -1149,38 +797,18 @@ def run_study(
             f"{extract_response.generation_time:.1f}s[/dim]"
         )
 
-        # Step 2: Load seed papers if requested
+        # Step 2: Build seed section for prompt
         seed_section = ""
-        seed_papers = None
-        if args.seeds > 0:
-            progress.update(task_id, description="Loading seed papers...")
-            seed_papers = load_seed_papers(study.study_id, study.name, args.seeds)
-            if seed_papers:
-                seed_section = "\n\n" + format_seed_papers(seed_papers, fields=args.seed_fields)
-                field_names = [SEED_FIELD_CODES[c] for c in args.seed_fields if c in SEED_FIELD_CODES]
-                log.print(f"[dim]  Loaded {len(seed_papers)} seed papers ({', '.join(field_names)})[/dim]")
-            else:
-                log.print("[yellow]  No valid seed papers found for this study[/yellow]")
-
-        eval_included_studies, added_seeds = merge_seed_papers_into_included(
-            included_studies,
-            seed_papers,
-        )
-        if added_seeds:
-            log.print(f"[dim]  Added {added_seeds} seed paper(s) to evaluation set[/dim]")
-        if eval_included_studies is not included_studies:
-            log.print(f"[dim]  Included studies (with seeds): {len(eval_included_studies)}[/dim]")
+        if seed_papers:
+            seed_section = "\n\n" + format_seed_papers(seed_papers, fields=args.seed_fields)
+            field_names = [SEED_FIELD_CODES[c] for c in args.seed_fields if c in SEED_FIELD_CODES]
+            log.print(f"[dim]  Using {len(seed_papers)} seed papers ({', '.join(field_names)})[/dim]")
 
         # Step 3: Generate query from extracted plan
         query_prompt = QUERY_PROMPT + "\n" + plan_info + seed_section
         if args.double_prompt:
             query_prompt = query_prompt + "\n\n---\n\n" + query_prompt
             log.print("[dim]  (prompt doubled)[/dim]")
-
-        # Save the final composed prompt
-        prompt_dir = Path("temp")
-        prompt_dir.mkdir(exist_ok=True)
-        (prompt_dir / "final-prompt.txt").write_text(query_prompt)
 
         def _generate_one(run_i: int) -> tuple[int, str, int, int, float]:
             resp = client.generate_text(prompt=query_prompt)
@@ -1219,11 +847,7 @@ def run_study(
                 if advance_step:
                     step(description)
                 else:
-                    progress.update(
-                        task_id,
-                        description=description,
-            
-                    )
+                    progress.update(task_id, description=description)
 
             cached_result = query_cache.get(query)
             if cached_result:
@@ -1244,11 +868,7 @@ def run_study(
                 )
 
             if known_count is None:
-                progress.update(
-                    task_id,
-                    description=f"{label}: counting results...",
-        
-                )
+                progress.update(task_id, description=f"{label}: counting results...")
             result_count = known_count if known_count is not None else pubmed.count_results(query)
             if result_count > max_count:
                 log.print(
@@ -1265,11 +885,7 @@ def run_study(
                 if total <= 0:
                     return
                 if batch_task_id is None:
-                    batch_task_id = progress.add_task(
-                        f"{label}: batches",
-                        total=total,
-            
-                    )
+                    batch_task_id = progress.add_task(f"{label}: batches", total=total)
                 progress.update(batch_task_id, completed=done)
 
             search_results = pubmed.execute_query_fast(
@@ -1288,7 +904,7 @@ def run_study(
             return search_results
 
         # Build final query: OR together unique queries if n > 1
-        unique_queries = list(dict.fromkeys(generated_queries))  # preserve order, dedupe
+        unique_queries = list(dict.fromkeys(generated_queries))
         if len(unique_queries) > 1:
             final_query = " OR ".join(f"({q})" for q in unique_queries)
             merged_query = final_query
@@ -1301,9 +917,7 @@ def run_study(
             try:
                 mesh_db = MeshDB(config.cache_dir)
                 expanded_query, stats = expand_mesh_entry_terms(
-                    final_query,
-                    mesh_db,
-                    max_terms=args.mesh_entry_max,
+                    final_query, mesh_db, max_terms=args.mesh_entry_max,
                 )
                 mesh_entry_stats = stats
                 if stats["entry_terms_added"] > 0:
@@ -1333,8 +947,7 @@ def run_study(
                 tfidf_skip_reason = "no_seed_papers"
             else:
                 raw_terms, term_stats = extract_tfidf_terms(
-                    seed_papers,
-                    max_terms=max(1, args.tfidf_top * 3),
+                    seed_papers, max_terms=max(1, args.tfidf_top * 3),
                 )
                 filtered_terms = filter_tfidf_terms(raw_terms, final_query)
                 tfidf_terms = filtered_terms[: max(1, args.tfidf_top)]
@@ -1354,10 +967,9 @@ def run_study(
 
         supplement_query = None
         supplement_stats = None
-        # Snapshot baseline PMIDs before any augmentation (for second-round similar)
         baseline_pmids = set(llm_results.pmid_map.keys())
 
-        # Optional two-pass refinement: generate a supplemental query for missed seed papers
+        # Optional two-pass refinement
         if args.two_pass:
             if not seed_papers:
                 log.print("[yellow]Two-pass enabled but no seed papers available; skipping[/yellow]")
@@ -1368,10 +980,7 @@ def run_study(
                 passes_run = 0
 
                 while passes_run < max_passes:
-                    missed_seed_papers, seed_unchecked = get_missed_seed_papers(
-                        seed_papers,
-                        llm_results,
-                    )
+                    missed_seed_papers, seed_unchecked = get_missed_seed_papers(seed_papers, llm_results)
                     if not missed_seed_papers:
                         log.print("[green]  Two-pass: all seed papers captured; stopping[/green]")
                         break
@@ -1383,22 +992,14 @@ def run_study(
                     )
 
                     supplement_seed_section = "\n\n" + format_seed_papers(
-                        missed_seed_papers,
-                        fields=args.seed_fields,
+                        missed_seed_papers, fields=args.seed_fields,
                     )
                     supplement_prompt = (
-                            SUPPLEMENT_PROMPT
-                            + "\n\nOriginal query:\n"
-                            + final_query
-                            + "\n\n"
-                            + plan_info
-                            + supplement_seed_section
+                        SUPPLEMENT_PROMPT
+                        + "\n\nOriginal query:\n" + final_query
+                        + "\n\n" + plan_info + supplement_seed_section
                     )
-                    progress.update(
-                        task_id,
-                        description=f"Generating supplement query {passes_run}...",
-            
-                    )
+                    progress.update(task_id, description=f"Generating supplement query {passes_run}...")
                     resp = client.generate_text(prompt=supplement_prompt)
                     supplement_query = extract_query_from_response(resp.content)
                     step(f"Generated supplement query {passes_run}")
@@ -1412,25 +1013,19 @@ def run_study(
                         progress.advance(task_id, 1)
                         break
 
-                    supplement_results = fetch_or_cached(
-                        supplement_query,
-                        f"Supplement query {passes_run}",
-                    )
+                    supplement_results = fetch_or_cached(supplement_query, f"Supplement query {passes_run}")
                     if supplement_results is None:
                         log.print("[yellow]Supplement query produced no results; stopping[/yellow]")
                         pass_stats.append({
                             "pass": passes_run,
                             "missed_seed_count": len(missed_seed_papers),
                             "seed_unchecked": seed_unchecked,
-                            "total_pmids": 0,
-                            "new_pmids": 0,
-                            "dup_pmids": 0,
+                            "total_pmids": 0, "new_pmids": 0, "dup_pmids": 0,
                         })
                         break
 
                     before_pmids = set(llm_results.pmid_map.keys())
                     before_dois = set(llm_results.doi_map.keys())
-                    found_before = count_found_studies(llm_results, eval_included_studies)
                     supplement_pmids = set(supplement_results.pmid_map.keys())
                     new_pmids = supplement_pmids - before_pmids
                     dup_pmids = supplement_pmids & before_pmids
@@ -1441,22 +1036,11 @@ def run_study(
                     for doi, info in supplement_results.doi_map.items():
                         if doi not in llm_results.doi_map:
                             llm_results.doi_map[doi] = info
-
                     llm_results.result_count += len(new_pmids)
-
-                    found_after = count_found_studies(llm_results, eval_included_studies)
-                    delta_found = found_after - found_before
-                    total_included = len(eval_included_studies)
-                    recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
-                    recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
 
                     log.print(
                         f"[dim]  Supplement {passes_run}: {len(supplement_pmids)} total PMIDs, "
                         f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
-                    )
-                    log.print(
-                        f"[dim]  Supplement recall: {found_before}->{found_after} "
-                        f"(+{delta_found}) [{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
                     )
 
                     pass_stats.append({
@@ -1467,11 +1051,6 @@ def run_study(
                         "new_pmids": len(new_pmids),
                         "dup_pmids": len(dup_pmids),
                         "new_dois": len(set(supplement_results.doi_map.keys()) - before_dois),
-                        "found_before": found_before,
-                        "found_after": found_after,
-                        "delta_found": delta_found,
-                        "recall_before": recall_before,
-                        "recall_after": recall_after,
                         "query": supplement_query,
                     })
 
@@ -1482,28 +1061,16 @@ def run_study(
                 if passes_run < max_passes:
                     progress.advance(task_id, (max_passes - passes_run) * 2)
 
-                if pass_stats:
-                    supplement_stats = {
-                        "passes_run": passes_run,
-                        "max_passes": max_passes,
-                        "passes": pass_stats,
-                    }
-                else:
-                    supplement_stats = {
-                        "passes_run": passes_run,
-                        "max_passes": max_passes,
-                        "passes": [],
-                    }
+                supplement_stats = {
+                    "passes_run": passes_run,
+                    "max_passes": max_passes,
+                    "passes": pass_stats,
+                }
 
         block_drop_stats = None
         if args.block_drop:
-            # Build raw candidates (no field restrictions) for auto-tightening
             raw_candidates = build_block_drop_candidates_raw(final_query)
-            # Also build with the configured field mode for backward compat
-            block_drop_queries = build_block_drop_queries(
-                final_query,
-                field_mode=args.block_drop_field,
-            )
+            block_drop_queries = build_block_drop_queries(final_query, field_mode=args.block_drop_field)
             if not block_drop_queries and not raw_candidates:
                 log.print("[yellow]Block-drop enabled but no AND blocks found; skipping[/yellow]")
                 progress.advance(task_id, 1)
@@ -1511,8 +1078,6 @@ def run_study(
                 max_results = max(1, int(args.block_drop_max_results))
                 before_pmids = set(llm_results.pmid_map.keys())
                 before_dois = set(llm_results.doi_map.keys())
-                found_before = count_found_studies(llm_results, eval_included_studies)
-                total_included = len(eval_included_studies)
                 per_query: list[dict] = []
                 total_new_pmids = 0
                 total_dup_pmids = 0
@@ -1520,30 +1085,20 @@ def run_study(
                 skipped = 0
                 tightened_count = 0
 
-                # Build tightening levels: start with the configured mode, then escalate
                 configured_mode = args.block_drop_field or "ti"
-                tighten_levels = []
-                for level_label, level_mode in _TIGHTEN_LEVELS:
-                    tighten_levels.append((level_label, level_mode))
-                # Ensure configured mode is first if not already in the list
+                tighten_levels = list(_TIGHTEN_LEVELS)
                 configured_in_list = any(m == configured_mode for _, m in tighten_levels)
                 if not configured_in_list:
                     tighten_levels.insert(0, (configured_mode, configured_mode))
 
                 for i, raw_q in enumerate(raw_candidates, 1):
                     label = f"Block-drop query {i}/{len(raw_candidates)}"
-                    progress.update(
-                        task_id,
-                        description=f"{label}: counting results...",
-            
-                    )
+                    progress.update(task_id, description=f"{label}: counting results...")
 
-                    # Try each tightening level until one fits under max_results
                     result = None
                     used_level = None
                     for level_label, level_mode in tighten_levels:
                         tightened_q = _apply_field_restrictions(raw_q, level_mode)
-                        # Check count first via cache or API
                         cached_result = query_cache.get(tightened_q)
                         if cached_result:
                             count = cached_result.result_count
@@ -1552,11 +1107,8 @@ def run_study(
 
                         if count <= max_results:
                             result = fetch_or_cached(
-                                tightened_q,
-                                label,
-                                max_count=max_results,
-                                known_count=count,
-                                advance_step=False,
+                                tightened_q, label,
+                                max_count=max_results, known_count=count, advance_step=False,
                             )
                             used_level = level_label
                             break
@@ -1568,11 +1120,7 @@ def run_study(
 
                     if result is None:
                         skipped += 1
-                        per_query.append({
-                            "query": raw_q,
-                            "skipped": True,
-                            "reason": "too_broad",
-                        })
+                        per_query.append({"query": raw_q, "skipped": True, "reason": "too_broad"})
                         continue
 
                     if used_level and used_level != configured_mode:
@@ -1597,7 +1145,6 @@ def run_study(
                     llm_results.result_count += len(new_pmids)
                     before_pmids |= new_pmids
                     before_dois |= new_dois
-
                     total_new_pmids += len(new_pmids)
                     total_dup_pmids += len(dup_pmids)
                     total_new_dois += len(new_dois)
@@ -1613,20 +1160,11 @@ def run_study(
                         "field_level": used_level,
                     })
 
-                found_after = count_found_studies(llm_results, eval_included_studies)
-                delta_found = found_after - found_before
-                recall_before = (found_before / total_included * 100) if total_included > 0 else 0.0
-                recall_after = (found_after / total_included * 100) if total_included > 0 else 0.0
-
                 tightened_msg = f", {tightened_count} auto-tightened" if tightened_count else ""
                 log.print(
                     f"[dim]  Block-drop: {len(raw_candidates)} queries, "
                     f"{total_new_pmids} new PMIDs, {total_dup_pmids} already in query"
                     f"{tightened_msg}[/dim]"
-                )
-                log.print(
-                    f"[dim]  Block-drop recall: {found_before}->{found_after} "
-                    f"(+{delta_found}) [{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
                 )
 
                 block_drop_stats = {
@@ -1638,11 +1176,6 @@ def run_study(
                     "total_new_pmids": total_new_pmids,
                     "total_dup_pmids": total_dup_pmids,
                     "total_new_dois": total_new_dois,
-                    "found_before": found_before,
-                    "found_after": found_after,
-                    "delta_found": delta_found,
-                    "recall_before": recall_before,
-                    "recall_after": recall_after,
                     "queries": per_query,
                 }
                 step("Block-drop supplements")
@@ -1650,11 +1183,8 @@ def run_study(
         tfidf_query = None
         tfidf_stats = None
         if args.tfidf:
-            if tfidf_skip_reason == "no_seed_papers":
-                log.print("[yellow]TF-IDF enabled but no seed papers available; skipping[/yellow]")
-                progress.advance(task_id, 1)
-            elif tfidf_skip_reason == "no_terms":
-                log.print("[yellow]TF-IDF enabled but no usable terms found; skipping[/yellow]")
+            if tfidf_skip_reason:
+                log.print(f"[yellow]TF-IDF skipped: {tfidf_skip_reason}[/yellow]")
                 progress.advance(task_id, 1)
             elif not tfidf_terms:
                 log.print("[yellow]TF-IDF enabled but no terms available; skipping[/yellow]")
@@ -1682,11 +1212,9 @@ def run_study(
                             progress.update(
                                 task_id,
                                 description=f"TF-IDF query: counting results ({attempt} terms, {field})...",
-                    
                             )
                             count = pubmed.count_results(candidate_query)
                         last_count = count
-
                         if count <= max_count:
                             tfidf_query = candidate_query
                             selected_terms = candidate_terms
@@ -1698,7 +1226,6 @@ def run_study(
                         break
                     if last_count is None:
                         break
-
                     if attempt == 1:
                         break
                     if last_count > max_count * 5 and attempt > 2:
@@ -1707,7 +1234,6 @@ def run_study(
                         attempt -= 1
 
                 if not tfidf_query or not selected_terms:
-                    # Final fallback: tighten by AND-ing top terms in title only.
                     strict_terms = tfidf_terms[: min(2, len(tfidf_terms))]
                     strict_query = build_tfidf_query(strict_terms, field="ti", joiner="AND") if strict_terms else ""
                     strict_count: int | None = None
@@ -1716,11 +1242,7 @@ def run_study(
                         if cached:
                             strict_count = cached.result_count
                         else:
-                            progress.update(
-                                task_id,
-                                description="TF-IDF query: tightening with AND (title-only)...",
-                    
-                            )
+                            progress.update(task_id, description="TF-IDF query: tightening with AND (title-only)...")
                             strict_count = pubmed.count_results(strict_query)
                     if strict_query and strict_count is not None and strict_count <= max_count:
                         tfidf_query = strict_query
@@ -1731,18 +1253,13 @@ def run_study(
                         log.print("[dim]  TF-IDF query: tightened to title-only AND[/dim]")
 
                 if not tfidf_query or not selected_terms:
-                    log.print(
-                        f"[yellow]TF-IDF query too broad (>{max_count:,} results); skipping[/yellow]"
-                    )
+                    log.print(f"[yellow]TF-IDF query too broad (>{max_count:,} results); skipping[/yellow]")
                     progress.advance(task_id, 1)
                 else:
                     if selected_field == "ti" and selected_joiner == "OR":
                         log.print("[dim]  TF-IDF query: fell back to title-only terms[/dim]")
                     tfidf_results = fetch_or_cached(
-                        tfidf_query,
-                        "TF-IDF query",
-                        max_count=max_count,
-                        known_count=selected_count,
+                        tfidf_query, "TF-IDF query", max_count=max_count, known_count=selected_count,
                     )
                     if tfidf_results:
                         before_pmids = set(llm_results.pmid_map.keys())
@@ -1757,8 +1274,8 @@ def run_study(
                         for doi, info in tfidf_results.doi_map.items():
                             if doi not in llm_results.doi_map:
                                 llm_results.doi_map[doi] = info
-
                         llm_results.result_count += len(new_pmids)
+
                         log.print(
                             f"[dim]  TF-IDF query: {len(tfidf_pmids)} total PMIDs, "
                             f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
@@ -1782,7 +1299,7 @@ def run_study(
 
         # Augment with citation searching if enabled
         citation_stats = None
-        if args.citations and args.seeds > 0 and seed_papers:
+        if args.citations and seed_papers:
             from .cache.citation_cache import CitationCache
             from .citation.openalex import OpenAlexClient as OAClient
 
@@ -1793,7 +1310,6 @@ def run_study(
             )
 
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
-            seed_doi_only = [p for p in seed_papers if not p.get("pmid") and p.get("doi")]
             query_pmid_count = len(llm_results.pmid_map)
             citation_pmids: set[str] = set()
             depth = max(1, int(getattr(args, "citation_depth", 1)))
@@ -1802,10 +1318,9 @@ def run_study(
             seed_missing_pmid: list[str] = []
             seed_no_id: list[str] = []
             seed_not_found_openalex: list[str] = []
-            doi_resolved_pmids: list[str] = []  # PMIDs resolved from DOI-only seeds
+            doi_resolved_pmids: list[str] = []
 
             if depth == 1:
-                # Simple path: use get_citations which returns from cache immediately
                 for sp in seed_papers:
                     sp_pmid = sp.get("pmid")
                     sp_doi = sp.get("doi")
@@ -1814,11 +1329,7 @@ def run_study(
                         continue
                     if sp_pmid:
                         progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
-                        cr = oa_client.get_citations(
-                            sp_pmid,
-                            cache=citation_cache,
-                            max_forward=2000,
-                        )
+                        cr = oa_client.get_citations(sp_pmid, cache=citation_cache, max_forward=2000)
                         if not cr.forward_pmids and not cr.backward_pmids:
                             seed_not_found_openalex.append(sp_pmid)
                         citation_pmids |= cr.all_pmids
@@ -1827,12 +1338,9 @@ def run_study(
                             f"{len(cr.backward_pmids)} backward[/dim]"
                         )
                     else:
-                        # DOI-only seed: look up via DOI
                         progress.update(task_id, description=f"Citations for DOI {sp_doi}...")
                         cr, resolved_pmid = oa_client.get_citations_by_doi(
-                            sp_doi,
-                            cache=citation_cache,
-                            max_forward=2000,
+                            sp_doi, cache=citation_cache, max_forward=2000,
                         )
                         if not cr.forward_pmids and not cr.backward_pmids:
                             seed_not_found_openalex.append(f"doi:{sp_doi}")
@@ -1849,7 +1357,6 @@ def run_study(
                             f"{len(cr.backward_pmids)} backward[/dim]"
                         )
             else:
-                # Depth > 1: need work IDs for frontier expansion
                 frontier_ids: set[str] = set()
                 visited_ids: set[str] = set()
                 for sp in seed_papers:
@@ -1861,9 +1368,7 @@ def run_study(
                     if sp_pmid:
                         progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
                         cr, work_ids, found = oa_client.get_citations_with_work_ids(
-                            sp_pmid,
-                            cache=citation_cache,
-                            direction=direction,
+                            sp_pmid, cache=citation_cache, direction=direction,
                         )
                         if not found:
                             seed_not_found_openalex.append(sp_pmid)
@@ -1877,12 +1382,9 @@ def run_study(
                             f"{len(cr.backward_pmids)} backward[/dim]"
                         )
                     else:
-                        # DOI-only seed: look up via DOI
                         progress.update(task_id, description=f"Citations for DOI {sp_doi}...")
                         cr, work_ids, found, resolved_pmid = oa_client.get_citations_with_work_ids_by_doi(
-                            sp_doi,
-                            cache=citation_cache,
-                            direction=direction,
+                            sp_doi, cache=citation_cache, direction=direction,
                         )
                         if not found:
                             seed_not_found_openalex.append(f"doi:{sp_doi}")
@@ -1911,15 +1413,10 @@ def run_study(
                     frontier_list = sorted(frontier_ids)
                     if max_frontier > 0 and len(frontier_list) > max_frontier:
                         frontier_list = frontier_list[:max_frontier]
-                        log.print(
-                            f"[dim]  Depth {level}: capped frontier to {len(frontier_list)} works[/dim]"
-                        )
+                        log.print(f"[dim]  Depth {level}: capped frontier to {len(frontier_list)} works[/dim]")
                     for oa_id in frontier_list:
-                        pmids, work_ids = oa_client.get_citations_for_work_id(
-                            oa_id,
-                            direction=direction,
-                        )
-                        citation_pmids |= pmids
+                        pmids_found, work_ids = oa_client.get_citations_for_work_id(oa_id, direction=direction)
+                        citation_pmids |= pmids_found
                         for wid in work_ids:
                             if wid and wid not in visited_ids:
                                 visited_ids.add(wid)
@@ -1934,43 +1431,18 @@ def run_study(
                     f"{', '.join(doi_resolved_pmids)}[/green]"
                 )
             if seed_no_id:
-                log.print(
-                    f"[yellow]  {len(seed_no_id)} seed paper(s) have no PMID or DOI; "
-                    "skipping for citations[/yellow]"
-                )
+                log.print(f"[yellow]  {len(seed_no_id)} seed paper(s) have no PMID or DOI[/yellow]")
             if seed_missing_pmid:
-                log.print(
-                    f"[yellow]  {len(seed_missing_pmid)} seed paper(s) could not be resolved to PMID "
-                    "(DOI not found in OpenAlex)[/yellow]"
-                )
+                log.print(f"[yellow]  {len(seed_missing_pmid)} seed paper(s) could not be resolved to PMID[/yellow]")
             if seed_not_found_openalex:
-                log.print(
-                    f"[yellow]  {len(seed_not_found_openalex)} seed(s) not found in OpenAlex[/yellow]"
-                )
+                log.print(f"[yellow]  {len(seed_not_found_openalex)} seed(s) not found in OpenAlex[/yellow]")
 
             citation_cache.save()
 
-            # Check how many citation PMIDs match included studies
-            included_pmids = {s.pmid for s in eval_included_studies if s.pmid}
             query_pmids_set = set(llm_results.pmid_map.keys())
             new_pmids = citation_pmids - query_pmids_set
-
-            if seed_pmids:
-                missing_seed_pmids = [p for p in seed_pmids if p not in query_pmids_set]
-                if not missing_seed_pmids:
-                    log.print("[green]  All seed PMIDs were captured in the first-pass query[/green]")
-                else:
-                    log.print(
-                        f"[yellow]  {len(missing_seed_pmids)} seed PMID(s) not captured in the first-pass query[/yellow]"
-                    )
-
-            # Included studies found via citations
-            citation_included_all = citation_pmids & included_pmids
-            citation_already_in_query = citation_included_all & query_pmids_set
-            citation_hits = citation_included_all - query_pmids_set  # truly new
-
-            # Add citation PMIDs to the search results
             citation_overlap = citation_pmids & query_pmids_set
+
             log.print(
                 f"[dim]  Citation pass (depth {depth}) total {len(citation_pmids)} PMIDs: "
                 f"{len(new_pmids)} new, {len(citation_overlap)} already in query[/dim]"
@@ -1978,9 +1450,6 @@ def run_study(
             citation_stats = {
                 "total": len(citation_pmids),
                 "new": len(new_pmids),
-                "hits": len(citation_hits),
-                "hits_already_in_query": len(citation_already_in_query),
-                "hits_total": len(citation_included_all),
                 "query_count": query_pmid_count,
                 "seed_total": len(seed_papers),
                 "seed_with_pmid": len(seed_pmids),
@@ -2001,29 +1470,13 @@ def run_study(
                     f"({query_pmid_count} query + {len(new_pmids)} citations "
                     f"= {len(llm_results.pmid_map)} total)[/dim]"
                 )
-                # Skip DOI enrichment for citation PMIDs — included studies with DOIs
-                # also have PMIDs, so PMID matching is sufficient and avoids extra API calls.
-                if citation_included_all:
-                    parts = []
-                    parts.append(f"{len(citation_included_all)} included studies in citations")
-                    if citation_hits:
-                        parts.append(f"{len(citation_hits)} new (not in query)")
-                    if citation_already_in_query:
-                        parts.append(f"{len(citation_already_in_query)} already in query")
-                    log.print(f"[green]  {', '.join(parts)}[/green]")
-                else:
-                    log.print("[dim]  No included studies found via citations[/dim]")
             else:
                 log.print("[dim]  No new PMIDs from citations[/dim]")
-
-            # Skip DOI-only citation resolution — included studies with DOIs also have PMIDs,
-            # so this step adds no recall value and is very slow (hundreds of API calls).
 
         # Augment with PubMed "Similar Articles" if enabled
         similar_stats = None
         if args.similar > 0 and seed_papers:
             seed_pmids = [p["pmid"] for p in seed_papers if p.get("pmid")]
-            # Resolve DOI-only seeds to PMIDs if not already done by citation step
             if not args.citations:
                 from .citation.openalex import OpenAlexClient as OAClient
                 _oa = OAClient(
@@ -2035,24 +1488,17 @@ def run_study(
                         resolved = _oa.resolve_doi_to_pmid(sp["doi"])
                         if resolved:
                             seed_pmids.append(resolved)
-                            log.print(
-                                f"[dim]  DOI {sp['doi']} resolved to PMID {resolved} for similar articles[/dim]"
-                            )
+                            log.print(f"[dim]  DOI {sp['doi']} resolved to PMID {resolved}[/dim]")
             if seed_pmids:
-                found_before = count_found_studies(llm_results, eval_included_studies)
-                total_included = len(eval_included_studies)
                 progress.update(task_id, description="Fetching similar articles...")
                 similar_map = fetch_similar_pmids(
-                    seed_pmids,
-                    email=config.entrez_email,
-                    api_key=config.entrez_api_key,
-                    rate_delay=rate_delay,
-                    per_seed=args.similar,
+                    seed_pmids, email=config.entrez_email, api_key=config.entrez_api_key,
+                    rate_delay=rate_delay, per_seed=args.similar,
                 )
                 step("Fetched similar articles")
                 similar_pmids = set()
-                for pmids in similar_map.values():
-                    similar_pmids.update(pmids)
+                for pmids_list in similar_map.values():
+                    similar_pmids.update(pmids_list)
 
                 before_pmids = set(llm_results.pmid_map.keys())
                 new_pmids = similar_pmids - before_pmids
@@ -2062,36 +1508,16 @@ def run_study(
                     llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(similar)"}
                 llm_results.result_count += len(new_pmids)
 
-                found_after = count_found_studies(llm_results, eval_included_studies)
-                delta_found = found_after - found_before
-                if total_included > 0:
-                    recall_before = found_before / total_included * 100
-                    recall_after = found_after / total_included * 100
-                else:
-                    recall_before = 0.0
-                    recall_after = 0.0
-
                 log.print(
                     f"[dim]  Similar articles: {len(similar_pmids)} total PMIDs, "
                     f"{len(new_pmids)} new, {len(dup_pmids)} already in first pass[/dim]"
                 )
-                log.print(
-                    f"[dim]  Similar recall: {found_before}->{found_after} "
-                    f"(+{delta_found}) "
-                    f"[{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
-                )
-
                 similar_stats = {
                     "seed_with_pmid": len(seed_pmids),
                     "per_seed": args.similar,
                     "total_pmids": len(similar_pmids),
                     "new_pmids": len(new_pmids),
                     "dup_pmids": len(dup_pmids),
-                    "found_before": found_before,
-                    "found_after": found_after,
-                    "delta_found": delta_found,
-                    "recall_before": recall_before,
-                    "recall_after": recall_after,
                 }
             else:
                 log.print("[yellow]Similar articles enabled but no seed PMIDs available[/yellow]")
@@ -2099,7 +1525,6 @@ def run_study(
         # Second-round similar articles on augmentation hits
         similar_augment_stats = None
         if args.similar_augment > 0:
-            # Collect all PMIDs added by augmentation steps (two-pass, block-drop, tfidf, citations, round-1 similar)
             augmentation_pmids = set(llm_results.pmid_map.keys()) - baseline_pmids
             if augmentation_pmids:
                 sample_size = min(len(augmentation_pmids), max(1, args.similar_augment_sample))
@@ -2109,21 +1534,16 @@ def run_study(
                     f"{len(augmentation_pmids)} augmentation-hit PMIDs[/dim]"
                 )
 
-                found_before = count_found_studies(llm_results, eval_included_studies)
-                total_included = len(eval_included_studies)
                 progress.update(task_id, description="Fetching similar articles (round 2)...")
                 aug_similar_map = fetch_similar_pmids(
-                    sampled,
-                    email=config.entrez_email,
-                    api_key=config.entrez_api_key,
-                    rate_delay=rate_delay,
-                    per_seed=args.similar_augment,
+                    sampled, email=config.entrez_email, api_key=config.entrez_api_key,
+                    rate_delay=rate_delay, per_seed=args.similar_augment,
                 )
                 step("Fetched similar articles (round 2)")
 
                 aug_similar_pmids = set()
-                for pmids in aug_similar_map.values():
-                    aug_similar_pmids.update(pmids)
+                for pmids_list in aug_similar_map.values():
+                    aug_similar_pmids.update(pmids_list)
 
                 before_pmids = set(llm_results.pmid_map.keys())
                 new_pmids = aug_similar_pmids - before_pmids
@@ -2133,25 +1553,10 @@ def run_study(
                     llm_results.pmid_map[pmid] = {"pmid": pmid, "title": "(similar-r2)"}
                 llm_results.result_count += len(new_pmids)
 
-                found_after = count_found_studies(llm_results, eval_included_studies)
-                delta_found = found_after - found_before
-                if total_included > 0:
-                    recall_before = found_before / total_included * 100
-                    recall_after = found_after / total_included * 100
-                else:
-                    recall_before = 0.0
-                    recall_after = 0.0
-
                 log.print(
                     f"[dim]  Similar-augment: {len(aug_similar_pmids)} total PMIDs, "
                     f"{len(new_pmids)} new, {len(dup_pmids)} already in results[/dim]"
                 )
-                log.print(
-                    f"[dim]  Similar-augment recall: {found_before}->{found_after} "
-                    f"(+{delta_found}) "
-                    f"[{recall_before:.1f}% -> {recall_after:.1f}%][/dim]"
-                )
-
                 similar_augment_stats = {
                     "augmentation_pool": len(augmentation_pmids),
                     "sampled": len(sampled),
@@ -2159,137 +1564,20 @@ def run_study(
                     "total_pmids": len(aug_similar_pmids),
                     "new_pmids": len(new_pmids),
                     "dup_pmids": len(dup_pmids),
-                    "found_before": found_before,
-                    "found_after": found_after,
-                    "delta_found": delta_found,
-                    "recall_before": recall_before,
-                    "recall_after": recall_after,
                 }
             else:
                 log.print("[dim]  Similar-augment: no augmentation-hit PMIDs to sample[/dim]")
 
-        progress.update(task_id, description="Checking PubMed indexing (LLM)...")
-        llm_metrics = calculate_metrics_with_pubmed_check(
-            llm_results,
-            eval_included_studies,
-            entrez_email=config.entrez_email,
-            rate_delay=rate_delay,
-            index_cache=index_cache,
-        )
-        step("Checked PubMed indexing (LLM)")
-
-        # Identify missed papers (PubMed-indexed only, enriched with seed paper metadata)
-        match_results = match_studies(llm_results, eval_included_studies)
-        missed_studies = [mr.study for mr in match_results if not mr.matched]
-
-        # Load seed papers JSON to enrich missed papers with metadata
-        seed_lookup: dict[str, dict] = {}
-        seed_path = SEED_PAPERS_DIR / f"{study.study_id} - {study.name}.json"
-        if not seed_path.exists():
-            seed_matches = list(SEED_PAPERS_DIR.glob(f"{study.study_id} - *.json"))
-            if seed_matches:
-                seed_path = seed_matches[0]
-        if seed_path.exists():
-            with open(seed_path) as f:
-                seed_data = json.load(f)
-            for sp in seed_data.get("papers", []):
-                if sp.get("pmid"):
-                    seed_lookup[sp["pmid"]] = sp
-                if sp.get("doi"):
-                    seed_lookup[sp["doi"].lower()] = sp
-
-        missed_papers = []
-        for ms in missed_studies:
-            # Only include PubMed-indexed papers (check via index_cache, populated earlier)
-            cached_status = index_cache.get(doi=ms.doi, pmid=ms.pmid)
-            if cached_status is False:
-                continue
-            # If not cached at all and no PMID, skip (likely not in PubMed)
-            if cached_status is None and not ms.pmid:
-                continue
-            # Try to enrich from seed papers cache
-            enriched = (seed_lookup.get(ms.pmid) if ms.pmid else None) or (seed_lookup.get(ms.doi) if ms.doi else None)
-            if enriched:
-                missed_papers.append({
-                    "title": enriched.get("title") or ms.title,
-                    "doi": enriched.get("doi") or ms.doi,
-                    "pmid": enriched.get("pmid") or ms.pmid,
-                    "abstract": enriched.get("abstract"),
-                    "mesh_terms": enriched.get("mesh_terms"),
-                    "keywords": enriched.get("keywords"),
-                })
-            else:
-                missed_papers.append({
-                    "title": ms.title,
-                    "doi": ms.doi,
-                    "pmid": ms.pmid,
-                })
-
-        # Evaluate human strategy (default, skip with --no-human)
-        human_metrics = None
-        human_query = None
-        if include_human:
-            from .cache.strategy_cache import StrategyCache
-
-            strategy_cache = StrategyCache(config.cache_dir)
-            cached = strategy_cache.get(study.search_strategy_docx)
-
-            if cached:
-                log.print("[dim]Using cached human strategy[/dim]")
-                human_query = cached.query
-                step("Human strategy: cached")
-            else:
-                from .llm.strategy_extractor import StrategyExtractor
-
-                extractor = StrategyExtractor(client, strategy_cache)
-                progress.update(task_id, description="Extracting human strategy...")
-                extracted = extractor.extract_strategy(study.search_strategy_docx)
-                step("Extracted human strategy")
-                if extracted.query:
-                    human_query = extracted.query
-
-            if human_query:
-                human_results = fetch_or_cached(human_query, "Human query")
-                if human_results:
-                    progress.update(task_id, description="Checking PubMed indexing (human)...")
-                    human_metrics = calculate_metrics_with_pubmed_check(
-                        human_results,
-                        eval_included_studies,
-                        entrez_email=config.entrez_email,
-                        rate_delay=rate_delay,
-                        index_cache=index_cache,
-                    )
-                    step("Checked PubMed indexing (human)")
-                else:
-                    # Advance remaining human steps so bar completes
-                    progress.advance(task_id, 2)
-            else:
-                log.print("[yellow]Failed to extract human strategy[/yellow]")
-                # Advance remaining human steps so bar completes
-                progress.advance(task_id, 2)
-        elif not args.no_human and not study.search_strategy_docx:
-            log.print("[yellow]No human search strategy available for this study[/yellow]")
-
-
-    # Print per-study results (outside progress context so bar is cleared)
-    console.print()
-    console.print("─" * 70)
-    print_study_table(console, llm_metrics, human_metrics)
-
-    return StudyResult(
-        study_id=study.study_id,
-        study_name=study.name,
-        llm_metrics=llm_metrics,
-        human_metrics=human_metrics,
+    return RunResult(
         llm_queries=generated_queries,
         merged_query=merged_query,
         executed_query=final_query,
-        human_query=human_query,
-        query_prompt=query_prompt,
-        missed_papers=missed_papers,
-        citation_stats=citation_stats,
+        final_pmid_map=dict(llm_results.pmid_map),
+        final_doi_map=dict(llm_results.doi_map),
+        total_result_count=llm_results.result_count,
         supplement_query=supplement_query,
         supplement_stats=supplement_stats,
+        citation_stats=citation_stats,
         similar_stats=similar_stats,
         similar_augment_stats=similar_augment_stats,
         mesh_entry_stats=mesh_entry_stats,
@@ -2299,595 +1587,349 @@ def run_study(
     )
 
 
-def save_results_md(results: list[StudyResult], args: argparse.Namespace) -> Path:
-    """Save results to a markdown file in results/."""
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
-    study_ids = "_".join(r.study_id for r in results)
-    results_dir = Path("results") / study_ids / date_str
-    results_dir.mkdir(parents=True, exist_ok=True)
+# ── Output ───────────────────────────────────────────────────────────────────
 
-    timestamp = now.strftime("%H%M")
-    filename = f"results_{timestamp}.md"
-    filepath = results_dir / filename
+
+def write_markdown_report(result: RunResult, args: argparse.Namespace, output_path: Path) -> None:
+    """Write a markdown report with queries and augmentation stats."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
-    lines.append(f"# Query Generation Results")
-    lines.append(f"")
+    lines.append("# Query Generation Report")
+    lines.append("")
     lines.append(f"- **Date**: {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
     lines.append(f"- **Model**: {MODEL}")
     lines.append(f"- **N runs**: {args.n}")
     lines.append(f"- **Double prompt**: {args.double_prompt}")
-    lines.append(f"- **Seed papers**: {args.seeds}")
-    lines.append(f"- **TF-IDF terms**: {args.tfidf}")
+    if args.seeds:
+        lines.append(f"- **Seed PMIDs**: {args.seeds}")
+    lines.append(f"- **Seed fields**: {args.seed_fields}")
+    lines.append(f"- **TF-IDF**: {args.tfidf}")
     if args.tfidf:
-        lines.append(f"- **TF-IDF top terms**: {args.tfidf_top}")
-        lines.append(f"- **TF-IDF max results**: {args.tfidf_max_results}")
-    lines.append(f"- **Block-drop supplement**: {args.block_drop}")
+        lines.append(f"  - Top terms: {args.tfidf_top}")
+        lines.append(f"  - Max results: {args.tfidf_max_results}")
+    lines.append(f"- **Block-drop**: {args.block_drop}")
     if args.block_drop:
-        lines.append(f"- **Block-drop max results**: {args.block_drop_max_results}")
-        lines.append(f"- **Block-drop field**: {args.block_drop_field}")
+        lines.append(f"  - Max results: {args.block_drop_max_results}")
+        lines.append(f"  - Field mode: {args.block_drop_field}")
     lines.append(f"- **Citations**: {args.citations}")
     if args.citations:
-        lines.append(f"- **Citation depth**: {args.citation_depth}")
-        lines.append(f"- **Citation direction**: {args.citation_direction}")
-        lines.append(
-            f"- **Citation max frontier**: {args.citation_max_frontier or 'none'}"
-        )
-    lines.append(f"- **Two-pass supplement**: {args.two_pass}")
+        lines.append(f"  - Depth: {args.citation_depth}")
+        lines.append(f"  - Direction: {args.citation_direction}")
+        lines.append(f"  - Max frontier: {args.citation_max_frontier or 'none'}")
+    lines.append(f"- **Two-pass**: {args.two_pass}")
     if args.two_pass:
-        lines.append(f"- **Two-pass max**: {args.two_pass_max}")
+        lines.append(f"  - Max passes: {args.two_pass_max}")
     lines.append(f"- **MeSH entry-term expansion**: {args.mesh_entry_terms}")
     if args.mesh_entry_terms:
-        lines.append(f"- **MeSH entry-term max**: {args.mesh_entry_max}")
+        lines.append(f"  - Max terms per heading: {args.mesh_entry_max}")
     lines.append(f"- **Similar articles per seed**: {args.similar}")
     if args.similar_augment > 0:
         lines.append(f"- **Similar-augment per PMID**: {args.similar_augment}")
-        lines.append(f"- **Similar-augment sample size**: {args.similar_augment_sample}")
-    lines.append(f"- **Studies**: {', '.join(r.study_id for r in results)}")
-    lines.append(f"")
+        lines.append(f"  - Sample size: {args.similar_augment_sample}")
+    lines.append("")
 
-    for r in results:
-        m = r.llm_metrics
-        h = r.human_metrics
+    # Result summary
+    lines.append("## Result Summary")
+    lines.append("")
+    lines.append(f"**Total PMIDs**: {result.total_result_count:,}")
+    lines.append("")
 
-        lines.append(f"## Study {r.study_id} - {r.study_name}")
-        lines.append(f"")
-        lines.append(f"| Metric | Generated | Human |")
-        lines.append(f"|--------|-----------|-------|")
-        lines.append(f"| Search results | {m.total_results} | {h.total_results if h else '—'} |")
-        lines.append(f"| Included studies | {m.total_included} | {h.total_included if h else '—'} |")
-        lines.append(f"| Not in PubMed | {m.not_in_pubmed} | {h.not_in_pubmed if h else '—'} |")
-        lines.append(f"| PubMed-indexed | {m.pubmed_indexed_count} | {h.pubmed_indexed_count if h else '—'} |")
-        lines.append(
-            f"| Captured | {m.found_pubmed}/{m.pubmed_indexed_count} | {h.found_pubmed}/{h.pubmed_indexed_count} |" if h else f"| Captured | {m.found_pubmed}/{m.pubmed_indexed_count} | — |")
-        lines.append(f"| Missed (in PubMed) | {m.missed_pubmed_indexed} | {h.missed_pubmed_indexed if h else '—'} |")
-        lines.append(
-            f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | {h.recall_overall * 100:.1f}% ({h.found}/{h.total_included}) |" if h else f"| Recall (overall) | {m.recall_overall * 100:.1f}% ({m.found}/{m.total_included}) | — |")
-        lines.append(
-            f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count}) | {h.recall_pubmed_only * 100:.1f}% ({h.found_pubmed}/{h.pubmed_indexed_count}) |" if h else f"| Recall (PubMed only) | {m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count}) | — |")
-        lines.append(
-            f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | {h.precision * 100:.2f}% ({h.found}/{h.total_results}) |" if h else f"| Precision | {m.precision * 100:.2f}% ({m.found}/{m.total_results}) | — |")
-        nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
-        h_nnr_str = f"{h.nnr:.1f}" if h and h.nnr != float("inf") else "—"
-        lines.append(f"| NNR | {nnr_str} | {h_nnr_str} |")
-        if r.citation_stats:
-            cs = r.citation_stats
-            lines.append(
-                f"| **Citations** | depth {cs.get('depth', 1)}, {cs.get('direction', 'both')}, "
-                f"cap {cs.get('max_frontier', 0) or 'none'} | — |"
-            )
-            lines.append(f"| **Citation PMIDs** | {cs['total']} total, {cs['new']} new | — |")
-            lines.append(
-                f"| **Citation included** | {cs['hits_total']} found ({cs['hits']} new, "
-                f"{cs['hits_already_in_query']} already in query) | — |"
-            )
-            lines.append(
-                f"| **Seed papers** | {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID"
-                + (f", {cs['seed_doi_resolved']} via DOI" if cs.get('seed_doi_resolved') else "")
-                + f", {cs.get('seed_missing_pmid', 0)} missing PMID, "
-                f"{cs.get('seed_not_found_openalex', 0)} not in OpenAlex | — |"
-            )
-        lines.append(f"")
-        if r.mesh_entry_stats:
-            ms = r.mesh_entry_stats
-            lines.append("**MeSH entry-term expansion**")
-            lines.append(
-                f"- Added {ms.get('entry_terms_added', 0)} terms across "
-                f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
-            )
-            lines.append(f"- Headings detected: {len(ms.get('mesh_terms_detected', []))}")
-            if ms.get("mesh_year"):
-                lines.append(f"- MeSH year: {ms.get('mesh_year')}")
-            if ms.get("mesh_terms_samples"):
-                samples = ", ".join(f"{t} (+{n})" for t, n in ms["mesh_terms_samples"])
-                lines.append(f"- Samples: {samples}")
-            lines.append(f"")
-        if r.supplement_stats:
-            ss = r.supplement_stats
-            lines.append("**Supplement pass**")
-            lines.append(
-                f"- Passes: {ss.get('passes_run', 0)} / {ss.get('max_passes', 0)}"
-            )
-            for ps in ss.get("passes", []):
-                lines.append(
-                    f"- Pass {ps.get('pass', 0)} missed seeds: {ps.get('missed_seed_count', 0)} "
-                    f"(unchecked: {ps.get('seed_unchecked', 0)})"
-                )
-                lines.append(
-                    f"- Pass {ps.get('pass', 0)} results: {ps.get('total_pmids', 0)} total PMIDs, "
-                    f"{ps.get('new_pmids', 0)} new, {ps.get('dup_pmids', 0)} already in first pass"
-                )
-                if "new_dois" in ps:
-                    lines.append(f"- Pass {ps.get('pass', 0)} DOIs added: {ps.get('new_dois', 0)}")
-                if "found_before" in ps:
-                    lines.append(
-                        f"- Pass {ps.get('pass', 0)} recall impact: {ps.get('found_before', 0)} -> {ps.get('found_after', 0)} "
-                        f"(+{ps.get('delta_found', 0)}), "
-                        f"{ps.get('recall_before', 0.0):.1f}% -> {ps.get('recall_after', 0.0):.1f}%"
-                    )
-                if ps.get("query"):
-                    lines.append("```")
-                    lines.append(ps["query"])
-                    lines.append("```")
-            lines.append(f"")
-        if r.block_drop_stats:
-            bs = r.block_drop_stats
-            lines.append("**Block-drop supplement**")
-            lines.append(
-                f"- Queries: {bs.get('queries_total', 0)} "
-                f"(skipped {bs.get('queries_skipped', 0)})"
-            )
-            lines.append(
-                f"- Field mode: {bs.get('field_mode', 'none')} | "
-                f"Max results: {bs.get('max_results', 0)}"
-            )
-            lines.append(
-                f"- Block-drop results: {bs.get('total_new_pmids', 0)} new PMIDs, "
-                f"{bs.get('total_dup_pmids', 0)} already in first pass"
-            )
-            lines.append(
-                f"- Recall impact: {bs.get('found_before', 0)} -> {bs.get('found_after', 0)} "
-                f"(+{bs.get('delta_found', 0)}), "
-                f"{bs.get('recall_before', 0.0):.1f}% -> {bs.get('recall_after', 0.0):.1f}%"
-            )
-            for q in bs.get("queries", []):
-                if q.get("query"):
-                    lines.append("```")
-                    lines.append(q["query"])
-                    lines.append("```")
-            lines.append(f"")
-        if r.tfidf_stats:
-            ts = r.tfidf_stats
-            lines.append("**TF-IDF term mining**")
-            lines.append(
-                f"- Docs used: {ts.get('docs_used', 0)} "
-                f"(skipped {ts.get('docs_skipped', 0)})"
-            )
-            lines.append(
-                f"- Terms used: {ts.get('terms_used', 0)} / {ts.get('terms_total', 0)}"
-            )
-            field = ts.get("field", "tiab")
-            joiner = (ts.get("joiner") or "OR").upper()
-            if joiner != "OR":
-                lines.append(f"- Field: {field} ({joiner})")
-            else:
-                lines.append(f"- Field: {field}")
-            lines.append(
-                f"- TF-IDF results: {ts.get('total_pmids', 0)} total PMIDs, "
-                f"{ts.get('new_pmids', 0)} new, {ts.get('dup_pmids', 0)} already in first pass"
-            )
-            if "new_dois" in ts:
-                lines.append(f"- DOIs added: {ts.get('new_dois', 0)}")
-            if ts.get("terms"):
-                lines.append(f"- Terms: {', '.join(ts['terms'])}")
-            lines.append(f"")
-        if r.similar_stats:
-            ss = r.similar_stats
-            lines.append("**Similar articles**")
-            lines.append(
-                f"- Seeds with PMID: {ss.get('seed_with_pmid', 0)}"
-            )
-            lines.append(
-                f"- Per-seed cap: {ss.get('per_seed', 0)}"
-            )
-            lines.append(
-                f"- Similar results: {ss.get('total_pmids', 0)} total PMIDs, "
-                f"{ss.get('new_pmids', 0)} new, {ss.get('dup_pmids', 0)} already in first pass"
-            )
-            if "found_before" in ss:
-                lines.append(
-                    f"- Recall impact: {ss.get('found_before', 0)} -> {ss.get('found_after', 0)} "
-                    f"(+{ss.get('delta_found', 0)}), "
-                    f"{ss.get('recall_before', 0.0):.1f}% -> {ss.get('recall_after', 0.0):.1f}%"
-                )
-            lines.append(f"")
-        if r.similar_augment_stats:
-            sa = r.similar_augment_stats
-            lines.append("**Similar articles (round 2 — augmentation hits)**")
-            lines.append(
-                f"- Augmentation pool: {sa.get('augmentation_pool', 0)} PMIDs, "
-                f"sampled {sa.get('sampled', 0)}"
-            )
-            lines.append(
-                f"- Per-PMID cap: {sa.get('per_pmid', 0)}"
-            )
-            lines.append(
-                f"- Results: {sa.get('total_pmids', 0)} total PMIDs, "
-                f"{sa.get('new_pmids', 0)} new, {sa.get('dup_pmids', 0)} already in results"
-            )
-            if "found_before" in sa:
-                lines.append(
-                    f"- Recall impact: {sa.get('found_before', 0)} -> {sa.get('found_after', 0)} "
-                    f"(+{sa.get('delta_found', 0)}), "
-                    f"{sa.get('recall_before', 0.0):.1f}% -> {sa.get('recall_after', 0.0):.1f}%"
-                )
-            lines.append(f"")
-
-    # Summary table if multiple studies
-    if len(results) > 1:
-        lines.append(f"## Summary")
-        lines.append(f"")
-        lines.append(
-            "| Study | Results | Recall | Recall (PM) | Precision | NNR | H-Recall | H-Recall (PM) | H-Results | H-Precision |"
-        )
-        lines.append(
-            "|-------|---------|--------|-------------|-----------|-----|----------|---------------|-----------|-------------|"
-        )
-
-        for r in results:
-            m = r.llm_metrics
-            h = r.human_metrics
-            label = f"{r.study_id} - {r.study_name}"
-            recall_str = f"{m.recall_overall * 100:.1f}% ({m.found}/{m.total_included})"
-            recall_pm_str = f"{m.recall_pubmed_only * 100:.1f}% ({m.found_pubmed}/{m.pubmed_indexed_count})"
-            precision_str = f"{m.precision * 100:.2f}%"
-            nnr_str = f"{m.nnr:.1f}" if m.nnr != float("inf") else "—"
-            h_recall_str = f"{h.recall_overall * 100:.1f}% ({h.found}/{h.total_included})" if h else "—"
-            h_recall_pm_str = f"{h.recall_pubmed_only * 100:.1f}% ({h.found_pubmed}/{h.pubmed_indexed_count})" if h else "—"
-            h_results_str = str(h.total_results) if h else "—"
-            h_precision_str = f"{h.precision * 100:.2f}%" if h else "—"
-            lines.append(
-                f"| {label} | {m.total_results} | {recall_str} | {recall_pm_str} | {precision_str} | {nnr_str} "
-                f"| {h_recall_str} | {h_recall_pm_str} | {h_results_str} | {h_precision_str} |"
-            )
-
-        # Averages
-        n = len(results)
-        avg_recall = sum(r.llm_metrics.recall_overall for r in results) / n * 100
-        avg_recall_pm = sum(r.llm_metrics.recall_pubmed_only for r in results) / n * 100
-        avg_precision = sum(r.llm_metrics.precision for r in results) / n * 100
-        finite_nnrs = [r.llm_metrics.nnr for r in results if r.llm_metrics.nnr != float("inf")]
-        avg_nnr = sum(finite_nnrs) / len(finite_nnrs) if finite_nnrs else float("inf")
-        avg_nnr_str = f"{avg_nnr:.1f}" if avg_nnr != float("inf") else "—"
-        avg_results = sum(r.llm_metrics.total_results for r in results) // n
-
-        human_with = [r for r in results if r.human_metrics is not None]
-        if human_with:
-            h_n = len(human_with)
-            h_avg_recall = sum(r.human_metrics.recall_overall for r in human_with) / h_n * 100
-            h_avg_recall_str = f"{h_avg_recall:.1f}%"
-            h_avg_recall_pm = sum(r.human_metrics.recall_pubmed_only for r in human_with) / h_n * 100
-            h_avg_recall_pm_str = f"{h_avg_recall_pm:.1f}%"
-            h_avg_results_str = str(sum(r.human_metrics.total_results for r in human_with) // h_n)
-            h_avg_precision = sum(r.human_metrics.precision for r in human_with) / h_n * 100
-            h_avg_precision_str = f"{h_avg_precision:.2f}%"
+    # Primary query
+    lines.append("## Primary Query")
+    lines.append("")
+    if result.llm_queries:
+        if len(result.llm_queries) == 1:
+            lines.append("```")
+            lines.append(result.llm_queries[0])
+            lines.append("```")
         else:
-            h_avg_recall_str = "—"
-            h_avg_recall_pm_str = "—"
-            h_avg_results_str = "—"
-            h_avg_precision_str = "—"
-
-        lines.append(
-            f"| **AVG** | **{avg_results}** | **{avg_recall:.1f}%** | **{avg_recall_pm:.1f}%** "
-            f"| **{avg_precision:.2f}%** | **{avg_nnr_str}** | **{h_avg_recall_str}** "
-            f"| **{h_avg_recall_pm_str}** | **{h_avg_results_str}** | **{h_avg_precision_str}** |"
-        )
-        lines.append(f"")
-
-    lines.append(f"## Queries")
-    lines.append(f"")
-    for r in results:
-        lines.append(f"### Study {r.study_id} - {r.study_name}")
-        lines.append(f"")
-        if r.llm_queries:
-            for i, q in enumerate(r.llm_queries):
-                label = f"LLM Query" if len(r.llm_queries) == 1 else f"LLM Query {i + 1}"
-                lines.append(f"**{label}:**")
-                lines.append(f"```")
+            for i, q in enumerate(result.llm_queries, 1):
+                lines.append(f"**LLM Query {i}:**")
+                lines.append("```")
                 lines.append(q)
-                lines.append(f"```")
-                lines.append(f"")
-        if r.merged_query:
-            lines.append(f"**Merged Query (OR union):**")
-            lines.append(f"```")
-            lines.append(r.merged_query)
-            lines.append(f"```")
-            lines.append(f"")
-        if r.executed_query:
-            lines.append(f"**Executed Query:**")
-            lines.append(f"```")
-            lines.append(r.executed_query)
-            lines.append(f"```")
-            lines.append(f"")
-        if r.tfidf_query:
-            lines.append(f"**TF-IDF Query:**")
-            lines.append(f"```")
-            lines.append(r.tfidf_query)
-            lines.append(f"```")
-            lines.append(f"")
-        if r.human_query:
-            lines.append(f"**Human Query:**")
-            lines.append(f"```")
-            lines.append(r.human_query)
-            lines.append(f"```")
-            lines.append(f"")
+                lines.append("```")
+                lines.append("")
+            if result.merged_query:
+                lines.append("**Merged Query (OR union):**")
+                lines.append("```")
+                lines.append(result.merged_query)
+                lines.append("```")
+    lines.append("")
 
-    if args.show_missed:
-        lines.append(f"## Missed Papers (PubMed-indexed only)")
-        lines.append(f"")
-        for r in results:
-            if r.missed_papers:
-                lines.append(f"### Study {r.study_id} - {r.study_name}")
-                lines.append(f"")
-                for i, p in enumerate(r.missed_papers, 1):
-                    title = p.get("title") or "—"
-                    pmid = p.get("pmid") or "—"
-                    doi = p.get("doi") or "—"
-                    lines.append(f"**{i}. {title}**")
-                    lines.append(f"- PMID: {pmid} | DOI: {doi}")
-                    if p.get("mesh_terms"):
-                        lines.append(f"- MeSH: {', '.join(p['mesh_terms'])}")
-                    if p.get("keywords"):
-                        lines.append(f"- Keywords: {', '.join(p['keywords'])}")
-                    if p.get("abstract"):
-                        abstract = p["abstract"]
-                        if len(abstract) > 500:
-                            abstract = abstract[:500] + "..."
-                        lines.append(f"- Abstract: {abstract}")
-                    lines.append(f"")
-            elif r.missed_papers is not None:
-                lines.append(f"### Study {r.study_id} - {r.study_name}")
-                lines.append(f"")
-                lines.append(f"No PubMed-indexed papers were missed.")
-                lines.append(f"")
+    if result.executed_query != (result.merged_query or (result.llm_queries[0] if result.llm_queries else "")):
+        lines.append("**Executed Query (after MeSH expansion):**")
+        lines.append("```")
+        lines.append(result.executed_query)
+        lines.append("```")
+        lines.append("")
 
-    if args.save_prompt:
-        lines.append(f"## Prompts")
-        lines.append(f"")
-        for r in results:
-            if r.query_prompt:
-                lines.append(f"### Study {r.study_id} - {r.study_name}")
-                lines.append(f"")
-                lines.append(f"```")
-                lines.append(r.query_prompt)
-                lines.append(f"```")
-                lines.append(f"")
+    # Augmentation details
+    has_augmentation = any([
+        result.mesh_entry_stats, result.supplement_stats, result.block_drop_stats,
+        result.tfidf_stats, result.citation_stats, result.similar_stats, result.similar_augment_stats,
+    ])
 
-    filepath.write_text("\n".join(lines))
-    return filepath
+    if has_augmentation:
+        lines.append("## Augmentation")
+        lines.append("")
+
+    if result.mesh_entry_stats:
+        ms = result.mesh_entry_stats
+        lines.append("### MeSH Entry-Term Expansion")
+        lines.append("")
+        lines.append(
+            f"- Added {ms.get('entry_terms_added', 0)} terms across "
+            f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
+        )
+        lines.append(f"- Headings detected: {len(ms.get('mesh_terms_detected', []))}")
+        if ms.get("mesh_year"):
+            lines.append(f"- MeSH year: {ms.get('mesh_year')}")
+        if ms.get("mesh_terms_samples"):
+            samples = ", ".join(f"{t} (+{n})" for t, n in ms["mesh_terms_samples"])
+            lines.append(f"- Samples: {samples}")
+        lines.append("")
+
+    if result.supplement_stats:
+        ss = result.supplement_stats
+        lines.append("### Two-Pass Supplement")
+        lines.append("")
+        lines.append(f"- Passes run: {ss.get('passes_run', 0)} / {ss.get('max_passes', 0)}")
+        for ps in ss.get("passes", []):
+            lines.append(
+                f"- Pass {ps.get('pass', 0)}: missed seeds={ps.get('missed_seed_count', 0)}, "
+                f"total PMIDs={ps.get('total_pmids', 0)}, new={ps.get('new_pmids', 0)}, "
+                f"duplicates={ps.get('dup_pmids', 0)}"
+            )
+            if ps.get("query"):
+                lines.append("  ```")
+                lines.append(f"  {ps['query']}")
+                lines.append("  ```")
+        lines.append("")
+
+    if result.block_drop_stats:
+        bs = result.block_drop_stats
+        lines.append("### Block-Drop Supplement")
+        lines.append("")
+        lines.append(
+            f"- Queries: {bs.get('queries_total', 0)} "
+            f"(skipped {bs.get('queries_skipped', 0)}, auto-tightened {bs.get('queries_tightened', 0)})"
+        )
+        lines.append(f"- Field mode: {bs.get('field_mode', 'none')} | Max results: {bs.get('max_results', 0):,}")
+        lines.append(
+            f"- New PMIDs: {bs.get('total_new_pmids', 0):,}, duplicates: {bs.get('total_dup_pmids', 0):,}"
+        )
+        for q in bs.get("queries", []):
+            if q.get("skipped"):
+                continue
+            query_text = q.get('query', '')
+            truncated = query_text[:80] + '...' if len(query_text) > 80 else query_text
+            lines.append(
+                f"- `{truncated}` — {q.get('result_count', 0):,} results, "
+                f"{q.get('new_pmids', 0)} new [{q.get('field_level', '')}]"
+            )
+        lines.append("")
+
+    if result.tfidf_stats:
+        ts = result.tfidf_stats
+        lines.append("### TF-IDF Term Mining")
+        lines.append("")
+        lines.append(f"- Docs used: {ts.get('docs_used', 0)} (skipped {ts.get('docs_skipped', 0)})")
+        lines.append(f"- Terms used: {ts.get('terms_used', 0)} / {ts.get('terms_total', 0)}")
+        field = ts.get("field", "tiab")
+        joiner = (ts.get("joiner") or "OR").upper()
+        lines.append(f"- Field: {field}" + (f" ({joiner})" if joiner != "OR" else ""))
+        lines.append(
+            f"- Results: {ts.get('total_pmids', 0):,} total, "
+            f"{ts.get('new_pmids', 0):,} new, {ts.get('dup_pmids', 0):,} duplicates"
+        )
+        if ts.get("terms"):
+            lines.append(f"- Terms: {', '.join(ts['terms'])}")
+        if result.tfidf_query:
+            lines.append("- Query:")
+            lines.append("  ```")
+            lines.append(f"  {result.tfidf_query}")
+            lines.append("  ```")
+        lines.append("")
+
+    if result.citation_stats:
+        cs = result.citation_stats
+        lines.append("### Citation Expansion")
+        lines.append("")
+        lines.append(
+            f"- Depth: {cs.get('depth', 1)}, direction: {cs.get('direction', 'both')}, "
+            f"frontier cap: {cs.get('max_frontier', 0) or 'none'}"
+        )
+        lines.append(f"- Total citation PMIDs: {cs['total']:,}, new: {cs['new']:,}")
+        lines.append(
+            f"- Seeds: {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID"
+            + (f", {cs['seed_doi_resolved']} resolved via DOI" if cs.get('seed_doi_resolved') else "")
+        )
+        lines.append("")
+
+    if result.similar_stats:
+        ss = result.similar_stats
+        lines.append("### Similar Articles")
+        lines.append("")
+        lines.append(f"- Seeds with PMID: {ss.get('seed_with_pmid', 0)}")
+        lines.append(f"- Per-seed cap: {ss.get('per_seed', 0)}")
+        lines.append(
+            f"- Results: {ss.get('total_pmids', 0):,} total, "
+            f"{ss.get('new_pmids', 0):,} new, {ss.get('dup_pmids', 0):,} duplicates"
+        )
+        lines.append("")
+
+    if result.similar_augment_stats:
+        sa = result.similar_augment_stats
+        lines.append("### Similar Articles (Round 2)")
+        lines.append("")
+        lines.append(
+            f"- Augmentation pool: {sa.get('augmentation_pool', 0):,} PMIDs, sampled {sa.get('sampled', 0)}"
+        )
+        lines.append(f"- Per-PMID cap: {sa.get('per_pmid', 0)}")
+        lines.append(
+            f"- Results: {sa.get('total_pmids', 0):,} total, "
+            f"{sa.get('new_pmids', 0):,} new, {sa.get('dup_pmids', 0):,} duplicates"
+        )
+        lines.append("")
+
+    output_path.write_text("\n".join(lines))
+
+
+def write_ris_file(result: RunResult, output_path: Path) -> None:
+    """Write RIS file with PMIDs and DOIs only."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build pmid -> DOIs lookup
+    pmid_dois: dict[str, list[str]] = {}
+    for pmid, info in result.final_pmid_map.items():
+        dois = info.get("dois", [])
+        if dois:
+            pmid_dois[pmid] = list(dois)
+
+    for doi, info in result.final_doi_map.items():
+        mapped_pmid = info.get("pmid")
+        if mapped_pmid:
+            if mapped_pmid not in pmid_dois:
+                pmid_dois[mapped_pmid] = []
+            if doi not in pmid_dois[mapped_pmid]:
+                pmid_dois[mapped_pmid].append(doi)
+
+    lines: list[str] = []
+    for pmid in result.final_pmid_map:
+        lines.append("TY  - JOUR")
+        lines.append(f"ID  - {pmid}")
+        for doi in pmid_dois.get(pmid, []):
+            lines.append(f"DO  - {doi}")
+        lines.append("ER  - ")
+        lines.append("")
+
+    output_path.write_text("\n".join(lines))
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a PubMed query from a PROSPERO PDF and evaluate it."
+        description="Generate a PubMed systematic review query from a PROSPERO PDF."
     )
-    parser.add_argument("studies", type=str, nargs="+", help="Study ID(s) (e.g., 34 or 34 35 36)")
+    parser.add_argument("prospero_pdf", type=Path, help="Path to PROSPERO protocol PDF")
     parser.add_argument(
-        "--no-human",
-        action="store_true",
-        help="Skip human strategy comparison",
-    )
-    parser.add_argument(
-        "--extract",
-        action="store_true",
-        help="Extract the systematic review plan from the PROSPERO PDF (no query generation)",
+        "--seeds", type=str, default="",
+        help="Comma-separated PMIDs of seed papers (e.g., --seeds 12345,67890)",
     )
     parser.add_argument(
-        "-n",
-        type=int,
-        default=1,
-        help="Run query generation N times and merge PubMed results (union of PMIDs)",
+        "--output", type=str, default="output",
+        help="Output file prefix (generates PREFIX.md and PREFIX.ris)",
     )
     parser.add_argument(
-        "--double-prompt",
-        action="store_true",
-        help="Repeat the query generation prompt twice in a single message for emphasis",
+        "--extract", action="store_true",
+        help="Extract the systematic review plan only (no query generation)",
     )
-    parser.add_argument(
-        "--seeds",
-        type=int,
-        default=0,
-        help="Number of random seed papers to include in the prompt (0 = disabled)",
-    )
-    parser.add_argument(
-        "--seed-fields",
-        type=str,
-        default="tamk",
-        help="Which seed paper fields to include: t=title, a=abstract, m=MeSH, k=keywords (default: tamk = all)",
-    )
-    parser.add_argument(
-        "--tfidf",
-        action="store_true",
-        help="Add a TF-IDF term-mined supplemental query from seed papers (requires --seeds)",
-    )
-    parser.add_argument(
-        "--tfidf-top",
-        type=int,
-        default=8,
-        help="Number of TF-IDF terms to include (default: 8)",
-    )
-    parser.add_argument(
-        "--tfidf-max-results",
-        type=int,
-        default=20000,
-        help="Maximum PubMed results allowed for TF-IDF supplemental query (default: 20000)",
-    )
-    parser.add_argument(
-        "--block-drop",
-        action="store_true",
-        help="Add block-drop supplemental queries by removing one top-level AND block",
-    )
-    parser.add_argument(
-        "--block-drop-max-results",
-        type=int,
-        default=20000,
-        help="Maximum PubMed results allowed for block-drop supplemental queries (default: 20000)",
-    )
-    parser.add_argument(
-        "--block-drop-field",
-        type=str,
-        default="ti",
-        help="Field-tightening mode for block-drop queries: none, ti, majr, ti+majr (default: ti)",
-    )
-    parser.add_argument(
-        "--save-prompt",
-        action="store_true",
-        help="Include the full LLM prompt in the results markdown file",
-    )
-    parser.add_argument(
-        "--show-missed",
-        action="store_true",
-        help="Include a list of missed (not captured) papers in the results file",
-    )
-    parser.add_argument(
-        "--citations",
-        action="store_true",
-        help="Augment query results with forward/backward citations of seed papers via OpenAlex (requires --seeds)",
-    )
-    parser.add_argument(
-        "--two-pass",
-        action="store_true",
-        help="Generate a supplementary query for missed seed papers and merge results",
-    )
-    parser.add_argument(
-        "--two-pass-max",
-        type=int,
-        default=3,
-        help="Maximum number of supplementary passes to run (default: 3)",
-    )
-    parser.add_argument(
-        "--mesh-entry-terms",
-        action="store_true",
-        help="Expand MeSH terms with entry-term free-text variants",
-    )
-    parser.add_argument(
-        "--mesh-entry-max",
-        type=int,
-        default=6,
-        help="Maximum number of entry terms per MeSH heading (default: 6)",
-    )
-    parser.add_argument(
-        "--similar",
-        type=int,
-        default=0,
-        help="Fetch up to N similar articles per seed paper and merge results (0 = disabled)",
-    )
-    parser.add_argument(
-        "--similar-augment",
-        type=int,
-        default=0,
-        help="Second-round similar articles: fetch up to N per augmentation-hit PMID (0 = disabled)",
-    )
-    parser.add_argument(
-        "--similar-augment-sample",
-        type=int,
-        default=10,
-        help="Max augmentation-hit PMIDs to sample for second-round similar articles (default: 10)",
-    )
-    parser.add_argument(
-        "--citation-depth",
-        type=int,
-        default=1,
-        help="Citation expansion depth (1 = direct citations only)",
-    )
-    parser.add_argument(
-        "--citation-direction",
-        type=str,
-        choices=["both", "forward", "backward"],
-        default="both",
-        help="Citation direction to follow (default: both)",
-    )
-    parser.add_argument(
-        "--citation-max-frontier",
-        type=int,
-        default=0,
-        help="Cap number of works expanded at each depth (0 = no cap)",
-    )
+    parser.add_argument("-n", type=int, default=1, help="Number of LLM query runs to merge (default: 1)")
+    parser.add_argument("--double-prompt", action="store_true", help="Repeat the prompt twice for emphasis")
+    parser.add_argument("--seed-fields", type=str, default="tamk", help="Seed fields: t=title, a=abstract, m=MeSH, k=keywords (default: tamk)")
+    parser.add_argument("--tfidf", action="store_true", help="Add TF-IDF supplemental query from seed papers")
+    parser.add_argument("--tfidf-top", type=int, default=8, help="Number of TF-IDF terms (default: 8)")
+    parser.add_argument("--tfidf-max-results", type=int, default=20000, help="Max results for TF-IDF query (default: 20000)")
+    parser.add_argument("--block-drop", action="store_true", help="Add block-drop supplemental queries")
+    parser.add_argument("--block-drop-max-results", type=int, default=20000, help="Max results for block-drop (default: 20000)")
+    parser.add_argument("--block-drop-field", type=str, default="ti", help="Field tightening: none, ti, majr, ti+majr (default: ti)")
+    parser.add_argument("--citations", action="store_true", help="Augment with citations via OpenAlex")
+    parser.add_argument("--two-pass", action="store_true", help="Generate supplementary queries for missed seed papers")
+    parser.add_argument("--two-pass-max", type=int, default=3, help="Max supplementary passes (default: 3)")
+    parser.add_argument("--mesh-entry-terms", action="store_true", help="Expand MeSH terms with entry-term variants")
+    parser.add_argument("--mesh-entry-max", type=int, default=6, help="Max entry terms per MeSH heading (default: 6)")
+    parser.add_argument("--similar", type=int, default=0, help="Similar articles per seed (0 = disabled)")
+    parser.add_argument("--similar-augment", type=int, default=0, help="Round 2 similar articles per augmentation PMID (0 = disabled)")
+    parser.add_argument("--similar-augment-sample", type=int, default=10, help="Max PMIDs to sample for round 2 (default: 10)")
+    parser.add_argument("--citation-depth", type=int, default=1, help="Citation expansion depth (default: 1)")
+    parser.add_argument("--citation-direction", type=str, choices=["both", "forward", "backward"], default="both", help="Citation direction (default: both)")
+    parser.add_argument("--citation-max-frontier", type=int, default=0, help="Cap works per depth (0 = no cap)")
     args = parser.parse_args()
 
     config = PipelineConfig.from_env()
     console = Console()
 
-    # Shared resources
-    finder = StudyFinder(config.data_dir)
+    if not args.prospero_pdf.exists():
+        console.print(f"[red]PROSPERO PDF not found: {args.prospero_pdf}[/red]")
+        sys.exit(1)
+
+    # Extract-only mode
+    if args.extract:
+        client = OpenAIClient(api_key=config.openai_api_key, model=MODEL)
+        response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=args.prospero_pdf)
+        console.print(response.content, markup=False, highlight=False)
+        sys.exit(0)
+
+    # Fetch seed papers from PubMed if PMIDs provided
+    seed_papers = None
+    if args.seeds:
+        seed_pmids = [p.strip() for p in args.seeds.split(",") if p.strip()]
+        if seed_pmids:
+            rate_delay = 0.1 if config.entrez_api_key else 0.34
+            console.print(f"[dim]Fetching metadata for {len(seed_pmids)} seed paper(s)...[/dim]")
+            seed_papers = fetch_seed_papers_by_pmid(
+                seed_pmids, config.entrez_email, config.entrez_api_key, rate_delay,
+            )
+            console.print(f"[dim]Fetched {len(seed_papers)} seed paper(s)[/dim]")
+
+    # Set up shared resources
     client = OpenAIClient(api_key=config.openai_api_key, model=MODEL)
     pubmed = PubMedExecutor(
-        email=config.entrez_email,
-        api_key=config.entrez_api_key,
+        email=config.entrez_email, api_key=config.entrez_api_key,
         batch_size=config.pubmed_batch_size,
     )
-    index_cache = PubMedIndexCache(config.cache_dir)
     query_cache = QueryResultsCache(config.cache_dir)
 
-    # Run each study
-    results: list[StudyResult] = []
-    for study_id in args.studies:
-        result = run_study(
-            study_id_arg=study_id,
-            args=args,
-            config=config,
-            finder=finder,
-            client=client,
-            pubmed=pubmed,
-            index_cache=index_cache,
-            query_cache=query_cache,
-            console=console,
-        )
-        if result:
-            results.append(result)
+    # Run the pipeline
+    result = run_pipeline(
+        prospero_pdf=args.prospero_pdf,
+        seed_papers=seed_papers,
+        args=args,
+        config=config,
+        client=client,
+        pubmed=pubmed,
+        query_cache=query_cache,
+        console=console,
+    )
 
-    # Print summary table if multiple studies were run
-    if len(results) > 1:
-        console.print()
-        console.print("━" * 70)
-        console.print("[bold]Summary across all studies[/bold]")
-        console.print()
+    if result is None:
+        console.print("[red]Pipeline produced no results[/red]")
+        sys.exit(1)
 
-        llm_summary = aggregate_metrics([r.llm_metrics for r in results])
-        llm_mean = mean_metrics([r.llm_metrics for r in results])
+    # Write outputs
+    md_path = Path(f"{args.output}.md")
+    ris_path = Path(f"{args.output}.ris")
 
-        human_metrics_list = [r.human_metrics for r in results if r.human_metrics is not None]
-        human_summary = None
-        human_mean = None
-        if len(human_metrics_list) == len(results):
-            human_summary = aggregate_metrics(human_metrics_list)
-            human_mean = mean_metrics(human_metrics_list)
-        elif human_metrics_list:
-            console.print(
-                f"[dim]Human summary omitted: only {len(human_metrics_list)}/{len(results)} "
-                f"studies have human strategies.[/dim]"
-            )
+    write_markdown_report(result, args, md_path)
+    write_ris_file(result, ris_path)
 
-        print_study_table(
-            console,
-            llm_summary,
-            human_summary,
-            title="Pooled totals (weighted)",
-        )
-        console.print()
-        print_study_table(
-            console,
-            llm_mean,
-            human_mean,
-            allow_float_counts=True,
-            title="Simple mean across studies",
-        )
-
-    # Save results to markdown
-    if results:
-        md_path = save_results_md(results, args)
-        console.print(f"[dim]Results saved to {md_path}[/dim]")
+    console.print(f"\n[bold]Results:[/bold]")
+    console.print(f"  Total PMIDs: {result.total_result_count:,}")
+    console.print(f"  Markdown report: {md_path}")
+    console.print(f"  RIS file: {ris_path}")
 
 
 if __name__ == "__main__":
