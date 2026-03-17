@@ -7,7 +7,7 @@ import re
 
 import requests
 
-from src.cache.citation_cache import CitationCache
+from ..cache.citation_cache import CitationCache
 
 logger = logging.getLogger(__name__)
 

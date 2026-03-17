@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.cache.strategy_cache import CachedStrategy, StrategyCache
+from ..cache.strategy_cache import CachedStrategy, StrategyCache
 
 from .openai_client import LLMResponse, OpenAIClient
 from .prompts import STRATEGY_EXTRACTION_PROMPT

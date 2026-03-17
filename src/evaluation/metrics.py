@@ -6,9 +6,9 @@ from typing import Any
 
 from Bio import Entrez, Medline
 
-from src.cache.pubmed_index_cache import PubMedIndexCache
-from src.compare_search import IncludedStudy, extract_included_studies
-from src.pubmed.search_executor import PubMedSearchResults
+from ..cache.pubmed_index_cache import PubMedIndexCache
+from ..compare_search import IncludedStudy, extract_included_studies
+from ..pubmed.search_executor import PubMedSearchResults
 
 
 @dataclass
