@@ -6,3 +6,4 @@ pubmed-queries
 seed_papers
 temp
 results
+__pycache__/
