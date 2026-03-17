@@ -129,18 +129,6 @@ DO  - 10.1234/example
 ER  -
 ```
 
-This file can be imported into reference managers (Zotero, EndNote, Mendeley, etc.) for screening.
-
-## Caching
-
-PubMed query results are cached locally to avoid redundant API calls:
-
-| Cache | Key | What's stored |
-|-------|-----|---------------|
-| `query_results_cache` | Exact query string | PMIDs, result count, DOI mappings |
-| `citation_cache` | Seed PMID | Forward and backward citation PMID lists |
-
-All caches are JSON files stored in the configured cache directory (default: `.cache/`).
 
 ## Rate Limits
 

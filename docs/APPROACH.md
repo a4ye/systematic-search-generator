@@ -67,11 +67,11 @@ The extracted plan is combined with a query generation prompt containing 11 inst
 
 After the LLM generates the query, MeSH headings in the query (e.g., `"Colorectal Neoplasms"[Mesh]`) are detected and expanded with entry-term synonyms from the MeSH database. For example, `"Colorectal Neoplasms"[Mesh]` might get `"Colorectal Tumor"[tiab]` and `"Colorectal Cancer"[tiab]` appended as OR terms.
 
-This is a deterministic, offline step — it uses the local MeSH XML database with no API calls. It catches free-text variants that the LLM may have missed.
+This is a deterministic, offline step that uses the local MeSH XML database with no API calls. It catches free-text variants that the LLM may have missed.
 
 ### 4. PubMed execution
 
-The final query is executed against PubMed via the NCBI Entrez API. Results are cached locally (keyed by exact query string) so repeated runs with the same query skip the API entirely.
+The final query is executed against PubMed via the NCBI Entrez API.
 
 ### 5. Two-pass supplement (`--two-pass`, `--two-pass-max`)
 
@@ -103,9 +103,7 @@ For each seed paper with a PMID, the pipeline queries the OpenAlex API to retrie
 - **Forward citations**: papers that cite the seed paper
 - **Backward citations**: papers referenced by the seed paper
 
-The PMIDs from these citations are added to the result set. This is purely graph-based traversal — it follows the citation network from known relevant papers regardless of what vocabulary they use.
-
-Results are cached locally per PMID so subsequent runs with the same seeds make zero API calls.
+The PMIDs from these citations are added to the result set. This is purely graph-based traversal that follows the citation network from known relevant papers regardless of what vocabulary they use.
 
 **Depth** (`--citation-depth`): At depth 1 (default), only direct citations of seed papers are fetched. At depth 2+, the pipeline expands outward through the citation graph (citations of citations), capped by `--citation-max-frontier`.
 
@@ -123,14 +121,3 @@ The pipeline writes two files:
 
 - **Markdown report** (`PREFIX.md`): Contains run settings, all generated queries, augmentation details and statistics, and total result count.
 - **RIS file** (`PREFIX.ris`): Contains one entry per PMID with DOI when available, importable into reference managers.
-
-## Caching
-
-The pipeline caches aggressively to avoid redundant API calls:
-
-| Cache | Key | What's stored |
-|-------|-----|---------------|
-| `query_results_cache` | Exact query string | PMIDs, result count, DOI mappings |
-| `citation_cache` | Seed PMID | Forward and backward citation PMID lists |
-
-All caches are JSON files stored in the configured cache directory.
