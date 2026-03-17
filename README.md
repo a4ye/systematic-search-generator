@@ -1,6 +1,6 @@
 # Automated PubMed Query Generation for Systematic Reviews
 
-This tool automatically generates PubMed Boolean search queries for systematic reviews. Given a PROSPERO protocol PDF and optional seed papers, it produces a high-recall search query using LLM-based generation combined with multiple augmentation strategies. Results are exported as a RIS file. This approach reduces errors by 69%, making 3.2x fewer mistakes than human-generated queries on the benchmark set of 11 reviews.
+This tool automatically generates PubMed Boolean search queries for systematic reviews. Given a PROSPERO protocol PDF and optional seed papers, it produces a high-recall search query using LLM-based generation combined with multiple augmentation strategies. Results are exported as a RIS file. This approach reduces errors by **69%**, making **3.2x** fewer mistakes than human-generated queries on the benchmark set of 11 reviews.
 
 ## Installation
 
@@ -142,7 +142,7 @@ Results across 11 systematic reviews (studies 34, 43, 76, 88, 92, 101, 110, 118,
 | **LLM-generated query** |  **97.8%**, stdev 1.1% | 17,621 |
 | Human query |                  92.9% | 1,805 |
 
-The LLM-generated queries average a 2.2% miss rate compared to the human average of 7.1%, a 69% reduction in errors. Put differently, human queries make 3.2x more mistakes than the LLM-generated queries on this benchmark set.
+The LLM-generated queries average a 2.2% miss rate compared to the human average of 7.1%, a **69%** reduction in errors. Put differently, human queries make **3.2x** more mistakes than the LLM-generated queries on this benchmark set.
 
 Recall is the fraction of included papers from the final published review that appear in the query results, counting only PubMed-indexed papers. Only PubMed is used because other databases (Embase, etc.) require paid subscriptions or institutional access. All of the human queries in the testing data were converted to PubMed queries in order to do the comparisons.
 
