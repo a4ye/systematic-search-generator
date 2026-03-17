@@ -707,6 +707,9 @@ class RunResult:
     final_pmid_map: dict[str, dict]
     final_doi_map: dict[str, dict]
     total_result_count: int
+    base_result_count: int = 0
+    base_total_count: int = 0  # total PubMed hits for primary query (may exceed fetched if capped)
+    max_pubmed_results: int = 10000
     supplement_query: str | None = None
     supplement_stats: dict | None = None
     citation_stats: dict | None = None
@@ -968,6 +971,8 @@ def run_pipeline(
         supplement_query = None
         supplement_stats = None
         baseline_pmids = set(llm_results.pmid_map.keys())
+        base_result_count = len(baseline_pmids)
+        base_total_count = llm_results.result_count  # total PubMed hits (may exceed fetched)
 
         # Optional two-pass refinement
         if args.two_pass:
@@ -1320,6 +1325,7 @@ def run_pipeline(
             seed_not_found_openalex: list[str] = []
             doi_resolved_pmids: list[str] = []
 
+            per_seed_citations: list[dict] = []
             if depth == 1:
                 for sp in seed_papers:
                     sp_pmid = sp.get("pmid")
@@ -1333,6 +1339,10 @@ def run_pipeline(
                         if not cr.forward_pmids and not cr.backward_pmids:
                             seed_not_found_openalex.append(sp_pmid)
                         citation_pmids |= cr.all_pmids
+                        per_seed_citations.append({
+                            "id": sp_pmid, "type": "pmid",
+                            "forward": len(cr.forward_pmids), "backward": len(cr.backward_pmids),
+                        })
                         log.print(
                             f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
                             f"{len(cr.backward_pmids)} backward[/dim]"
@@ -1346,12 +1356,18 @@ def run_pipeline(
                             seed_not_found_openalex.append(f"doi:{sp_doi}")
                         citation_pmids |= cr.all_pmids
                         label = f"DOI {sp_doi}"
+                        cit_id = sp_doi
                         if resolved_pmid:
                             label += f" (PMID {resolved_pmid})"
+                            cit_id = f"{sp_doi} (PMID {resolved_pmid})"
                             doi_resolved_pmids.append(resolved_pmid)
                             seed_pmids.append(resolved_pmid)
                         else:
                             seed_missing_pmid.append(sp.get("title") or sp_doi)
+                        per_seed_citations.append({
+                            "id": cit_id, "type": "doi",
+                            "forward": len(cr.forward_pmids), "backward": len(cr.backward_pmids),
+                        })
                         log.print(
                             f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
                             f"{len(cr.backward_pmids)} backward[/dim]"
@@ -1377,6 +1393,10 @@ def run_pipeline(
                             if wid:
                                 frontier_ids.add(wid)
                                 visited_ids.add(wid)
+                        per_seed_citations.append({
+                            "id": sp_pmid, "type": "pmid",
+                            "forward": len(cr.forward_pmids), "backward": len(cr.backward_pmids),
+                        })
                         log.print(
                             f"[dim]  PMID {sp_pmid}: {len(cr.forward_pmids)} forward, "
                             f"{len(cr.backward_pmids)} backward[/dim]"
@@ -1394,12 +1414,18 @@ def run_pipeline(
                                 frontier_ids.add(wid)
                                 visited_ids.add(wid)
                         label = f"DOI {sp_doi}"
+                        cit_id = sp_doi
                         if resolved_pmid:
                             label += f" (PMID {resolved_pmid})"
+                            cit_id = f"{sp_doi} (PMID {resolved_pmid})"
                             doi_resolved_pmids.append(resolved_pmid)
                             seed_pmids.append(resolved_pmid)
                         else:
                             seed_missing_pmid.append(sp.get("title") or sp_doi)
+                        per_seed_citations.append({
+                            "id": cit_id, "type": "doi",
+                            "forward": len(cr.forward_pmids), "backward": len(cr.backward_pmids),
+                        })
                         log.print(
                             f"[dim]  {label}: {len(cr.forward_pmids)} forward, "
                             f"{len(cr.backward_pmids)} backward[/dim]"
@@ -1459,6 +1485,7 @@ def run_pipeline(
                 "depth": depth,
                 "direction": direction,
                 "max_frontier": max_frontier,
+                "per_seed": per_seed_citations,
             }
 
             if new_pmids:
@@ -1497,8 +1524,13 @@ def run_pipeline(
                 )
                 step("Fetched similar articles")
                 similar_pmids = set()
-                for pmids_list in similar_map.values():
+                per_seed_similar: list[dict] = []
+                for seed_pmid, pmids_list in similar_map.items():
                     similar_pmids.update(pmids_list)
+                    per_seed_similar.append({
+                        "seed_pmid": seed_pmid,
+                        "count": len(pmids_list),
+                    })
 
                 before_pmids = set(llm_results.pmid_map.keys())
                 new_pmids = similar_pmids - before_pmids
@@ -1518,6 +1550,7 @@ def run_pipeline(
                     "total_pmids": len(similar_pmids),
                     "new_pmids": len(new_pmids),
                     "dup_pmids": len(dup_pmids),
+                    "per_seed_breakdown": per_seed_similar,
                 }
             else:
                 log.print("[yellow]Similar articles enabled but no seed PMIDs available[/yellow]")
@@ -1557,13 +1590,18 @@ def run_pipeline(
                     f"[dim]  Similar-augment: {len(aug_similar_pmids)} total PMIDs, "
                     f"{len(new_pmids)} new, {len(dup_pmids)} already in results[/dim]"
                 )
+                per_sampled_similar: list[dict] = []
+                for s_pmid, s_list in aug_similar_map.items():
+                    per_sampled_similar.append({"seed_pmid": s_pmid, "count": len(s_list)})
                 similar_augment_stats = {
                     "augmentation_pool": len(augmentation_pmids),
                     "sampled": len(sampled),
+                    "sampled_pmids": list(sampled),
                     "per_pmid": args.similar_augment,
                     "total_pmids": len(aug_similar_pmids),
                     "new_pmids": len(new_pmids),
                     "dup_pmids": len(dup_pmids),
+                    "per_seed_breakdown": per_sampled_similar,
                 }
             else:
                 log.print("[dim]  Similar-augment: no augmentation-hit PMIDs to sample[/dim]")
@@ -1575,6 +1613,9 @@ def run_pipeline(
         final_pmid_map=dict(llm_results.pmid_map),
         final_doi_map=dict(llm_results.doi_map),
         total_result_count=llm_results.result_count,
+        base_result_count=base_result_count,
+        base_total_count=base_total_count,
+        max_pubmed_results=config.max_pubmed_results,
         supplement_query=supplement_query,
         supplement_stats=supplement_stats,
         citation_stats=citation_stats,
@@ -1591,11 +1632,19 @@ def run_pipeline(
 
 
 def write_markdown_report(result: RunResult, args: argparse.Namespace, output_path: Path) -> None:
-    """Write a markdown report with queries and augmentation stats."""
+    """Write a markdown report with queries and augmentation stats.
+
+    The report is designed so that someone can replicate the entire search
+    using only the information in the markdown file.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
     lines.append("# Query Generation Report")
+    lines.append("")
+
+    # ── Settings ──
+    lines.append("## Settings")
     lines.append("")
     lines.append(f"- **Date**: {datetime.now().strftime('%b %d, %Y at %I:%M %p')}")
     lines.append(f"- **Model**: {MODEL}")
@@ -1629,169 +1678,321 @@ def write_markdown_report(result: RunResult, args: argparse.Namespace, output_pa
         lines.append(f"  - Sample size: {args.similar_augment_sample}")
     lines.append("")
 
-    # Result summary
+    # ── Result Summary with breakdown ──
     lines.append("## Result Summary")
     lines.append("")
-    lines.append(f"**Total PMIDs**: {result.total_result_count:,}")
+    lines.append(f"**Total unique PMIDs**: {result.total_result_count:,}")
     lines.append("")
-
-    # Primary query
-    lines.append("## Primary Query")
-    lines.append("")
-    if result.llm_queries:
-        if len(result.llm_queries) == 1:
-            lines.append("```")
-            lines.append(result.llm_queries[0])
-            lines.append("```")
-        else:
-            for i, q in enumerate(result.llm_queries, 1):
-                lines.append(f"**LLM Query {i}:**")
-                lines.append("```")
-                lines.append(q)
-                lines.append("```")
-                lines.append("")
-            if result.merged_query:
-                lines.append("**Merged Query (OR union):**")
-                lines.append("```")
-                lines.append(result.merged_query)
-                lines.append("```")
-    lines.append("")
-
-    if result.executed_query != (result.merged_query or (result.llm_queries[0] if result.llm_queries else "")):
-        lines.append("**Executed Query (after MeSH expansion):**")
-        lines.append("```")
-        lines.append(result.executed_query)
-        lines.append("```")
-        lines.append("")
-
-    # Augmentation details
-    has_augmentation = any([
-        result.mesh_entry_stats, result.supplement_stats, result.block_drop_stats,
-        result.tfidf_stats, result.citation_stats, result.similar_stats, result.similar_augment_stats,
-    ])
-
-    if has_augmentation:
-        lines.append("## Augmentation")
-        lines.append("")
-
-    if result.mesh_entry_stats:
-        ms = result.mesh_entry_stats
-        lines.append("### MeSH Entry-Term Expansion")
-        lines.append("")
-        lines.append(
-            f"- Added {ms.get('entry_terms_added', 0)} terms across "
-            f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
-        )
-        lines.append(f"- Headings detected: {len(ms.get('mesh_terms_detected', []))}")
-        if ms.get("mesh_year"):
-            lines.append(f"- MeSH year: {ms.get('mesh_year')}")
-        if ms.get("mesh_terms_samples"):
-            samples = ", ".join(f"{t} (+{n})" for t, n in ms["mesh_terms_samples"])
-            lines.append(f"- Samples: {samples}")
-        lines.append("")
-
+    lines.append("| Source | PMIDs | New | Duplicates |")
+    lines.append("|--------|------:|----:|-----------:|")
+    lines.append(f"| Primary query | {result.base_result_count:,} | {result.base_result_count:,} | 0 |")
     if result.supplement_stats:
         ss = result.supplement_stats
-        lines.append("### Two-Pass Supplement")
-        lines.append("")
-        lines.append(f"- Passes run: {ss.get('passes_run', 0)} / {ss.get('max_passes', 0)}")
-        for ps in ss.get("passes", []):
-            lines.append(
-                f"- Pass {ps.get('pass', 0)}: missed seeds={ps.get('missed_seed_count', 0)}, "
-                f"total PMIDs={ps.get('total_pmids', 0)}, new={ps.get('new_pmids', 0)}, "
-                f"duplicates={ps.get('dup_pmids', 0)}"
-            )
-            if ps.get("query"):
-                lines.append("  ```")
-                lines.append(f"  {ps['query']}")
-                lines.append("  ```")
-        lines.append("")
-
+        supp_new = sum(p.get("new_pmids", 0) for p in ss.get("passes", []))
+        supp_dup = sum(p.get("dup_pmids", 0) for p in ss.get("passes", []))
+        supp_total = sum(p.get("total_pmids", 0) for p in ss.get("passes", []))
+        lines.append(f"| Two-pass supplement | {supp_total:,} | {supp_new:,} | {supp_dup:,} |")
     if result.block_drop_stats:
         bs = result.block_drop_stats
-        lines.append("### Block-Drop Supplement")
-        lines.append("")
+        bd_total = bs.get("total_new_pmids", 0) + bs.get("total_dup_pmids", 0)
         lines.append(
-            f"- Queries: {bs.get('queries_total', 0)} "
-            f"(skipped {bs.get('queries_skipped', 0)}, auto-tightened {bs.get('queries_tightened', 0)})"
+            f"| Block-drop | {bd_total:,} | "
+            f"{bs.get('total_new_pmids', 0):,} | {bs.get('total_dup_pmids', 0):,} |"
         )
-        lines.append(f"- Field mode: {bs.get('field_mode', 'none')} | Max results: {bs.get('max_results', 0):,}")
-        lines.append(
-            f"- New PMIDs: {bs.get('total_new_pmids', 0):,}, duplicates: {bs.get('total_dup_pmids', 0):,}"
-        )
-        for q in bs.get("queries", []):
-            if q.get("skipped"):
-                continue
-            query_text = q.get('query', '')
-            truncated = query_text[:80] + '...' if len(query_text) > 80 else query_text
-            lines.append(
-                f"- `{truncated}` — {q.get('result_count', 0):,} results, "
-                f"{q.get('new_pmids', 0)} new [{q.get('field_level', '')}]"
-            )
-        lines.append("")
-
     if result.tfidf_stats:
         ts = result.tfidf_stats
-        lines.append("### TF-IDF Term Mining")
-        lines.append("")
-        lines.append(f"- Docs used: {ts.get('docs_used', 0)} (skipped {ts.get('docs_skipped', 0)})")
-        lines.append(f"- Terms used: {ts.get('terms_used', 0)} / {ts.get('terms_total', 0)}")
-        field = ts.get("field", "tiab")
-        joiner = (ts.get("joiner") or "OR").upper()
-        lines.append(f"- Field: {field}" + (f" ({joiner})" if joiner != "OR" else ""))
         lines.append(
-            f"- Results: {ts.get('total_pmids', 0):,} total, "
-            f"{ts.get('new_pmids', 0):,} new, {ts.get('dup_pmids', 0):,} duplicates"
+            f"| TF-IDF | {ts.get('total_pmids', 0):,} | "
+            f"{ts.get('new_pmids', 0):,} | {ts.get('dup_pmids', 0):,} |"
         )
-        if ts.get("terms"):
-            lines.append(f"- Terms: {', '.join(ts['terms'])}")
-        if result.tfidf_query:
-            lines.append("- Query:")
-            lines.append("  ```")
-            lines.append(f"  {result.tfidf_query}")
-            lines.append("  ```")
-        lines.append("")
-
     if result.citation_stats:
         cs = result.citation_stats
-        lines.append("### Citation Expansion")
-        lines.append("")
         lines.append(
-            f"- Depth: {cs.get('depth', 1)}, direction: {cs.get('direction', 'both')}, "
-            f"frontier cap: {cs.get('max_frontier', 0) or 'none'}"
+            f"| Citations (OpenAlex) | {cs['total']:,} | "
+            f"{cs['new']:,} | {cs['total'] - cs['new']:,} |"
         )
-        lines.append(f"- Total citation PMIDs: {cs['total']:,}, new: {cs['new']:,}")
-        lines.append(
-            f"- Seeds: {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)} with PMID"
-            + (f", {cs['seed_doi_resolved']} resolved via DOI" if cs.get('seed_doi_resolved') else "")
-        )
-        lines.append("")
-
     if result.similar_stats:
         ss = result.similar_stats
-        lines.append("### Similar Articles")
-        lines.append("")
-        lines.append(f"- Seeds with PMID: {ss.get('seed_with_pmid', 0)}")
-        lines.append(f"- Per-seed cap: {ss.get('per_seed', 0)}")
         lines.append(
-            f"- Results: {ss.get('total_pmids', 0):,} total, "
-            f"{ss.get('new_pmids', 0):,} new, {ss.get('dup_pmids', 0):,} duplicates"
+            f"| Similar articles | {ss.get('total_pmids', 0):,} | "
+            f"{ss.get('new_pmids', 0):,} | {ss.get('dup_pmids', 0):,} |"
+        )
+    if result.similar_augment_stats:
+        sa = result.similar_augment_stats
+        lines.append(
+            f"| Similar articles (round 2) | {sa.get('total_pmids', 0):,} | "
+            f"{sa.get('new_pmids', 0):,} | {sa.get('dup_pmids', 0):,} |"
+        )
+    lines.append("")
+
+    # ── Queries Executed on PubMed ──
+    lines.append("## Queries Executed on PubMed")
+    lines.append("")
+    lines.append("All queries below were executed via the NCBI Entrez API (`esearch` + `esummary`). "
+                 "To replicate, run each query on [PubMed](https://pubmed.ncbi.nlm.nih.gov/) "
+                 "and take the union of all result PMIDs.")
+    lines.append("")
+    lines.append(
+        f"**Fetch limit**: {result.max_pubmed_results:,} PMIDs per query "
+        f"(`MAX_PUBMED_RESULTS`). If a query returns more results than this limit, "
+        f"only the first {result.max_pubmed_results:,} are fetched. "
+        f"PubMed's default sort order is by relevance when using the Entrez API."
+    )
+    lines.append("")
+
+    # 1. Primary query
+    lines.append("### 1. Primary Query")
+    lines.append("")
+    if result.base_total_count > result.base_result_count:
+        lines.append(
+            f"PubMed returned **{result.base_total_count:,}** total results. "
+            f"Only the first **{result.base_result_count:,}** PMIDs were fetched "
+            f"(capped at `MAX_PUBMED_RESULTS={result.max_pubmed_results:,}`). "
+            f"PubMed sorts by relevance by default when results are capped."
+        )
+    else:
+        lines.append(f"Result count: **{result.base_result_count:,}** PMIDs (all results fetched)")
+    lines.append("")
+
+    if result.llm_queries and len(result.llm_queries) > 1:
+        lines.append("<details>")
+        lines.append(f"<summary>Individual LLM queries ({len(result.llm_queries)} runs, merged with OR)</summary>")
+        lines.append("")
+        for i, q in enumerate(result.llm_queries, 1):
+            lines.append(f"**LLM Query {i}:**")
+            lines.append("```")
+            lines.append(q)
+            lines.append("```")
+            lines.append("")
+        if result.merged_query:
+            lines.append("**Merged Query (OR union):**")
+            lines.append("```")
+            lines.append(result.merged_query)
+            lines.append("```")
+            lines.append("")
+        lines.append("</details>")
+        lines.append("")
+
+    executed_differs = result.executed_query != (result.merged_query or (result.llm_queries[0] if result.llm_queries else ""))
+    if executed_differs:
+        lines.append("**Executed query** (after MeSH entry-term expansion):")
+    elif result.llm_queries and len(result.llm_queries) == 1:
+        lines.append("**Executed query:**")
+    else:
+        lines.append("**Executed query:**")
+    lines.append("")
+    lines.append("```")
+    lines.append(result.executed_query)
+    lines.append("```")
+    lines.append("")
+
+    # MeSH entry-term expansion details (informational, not a separate query)
+    if result.mesh_entry_stats:
+        ms = result.mesh_entry_stats
+        lines.append("**MeSH entry-term expansion applied to the query above:**")
+        lines.append("")
+        lines.append(
+            f"- Added {ms.get('entry_terms_added', 0)} free-text terms across "
+            f"{ms.get('mesh_terms_expanded', 0)}/{ms.get('mesh_terms_found', 0)} MeSH headings"
+        )
+        if ms.get("mesh_year"):
+            lines.append(f"- MeSH database year: {ms.get('mesh_year')}")
+        if ms.get("mesh_terms_samples"):
+            lines.append("- Expansions:")
+            for term, count in ms["mesh_terms_samples"]:
+                lines.append(f"  - {term} (+{count} entry terms)")
+        lines.append("")
+
+    # 2. Two-pass supplement queries
+    query_num = 2
+    if result.supplement_stats:
+        ss = result.supplement_stats
+        lines.append(f"### {query_num}. Two-Pass Supplement Queries")
+        lines.append("")
+        lines.append(f"Passes run: {ss.get('passes_run', 0)} / {ss.get('max_passes', 0)} max")
+        lines.append("")
+        if not ss.get("passes"):
+            lines.append("No supplement passes were needed (all seed papers found in primary query).")
+            lines.append("")
+        for ps in ss.get("passes", []):
+            lines.append(
+                f"**Pass {ps.get('pass', 0)}** — "
+                f"missed seeds: {ps.get('missed_seed_count', 0)}, "
+                f"results: {ps.get('total_pmids', 0):,} PMIDs "
+                f"({ps.get('new_pmids', 0):,} new, {ps.get('dup_pmids', 0):,} duplicates)"
+            )
+            if ps.get("query"):
+                lines.append("")
+                lines.append("```")
+                lines.append(ps['query'])
+                lines.append("```")
+            lines.append("")
+        query_num += 1
+
+    # 3. Block-drop supplement queries
+    if result.block_drop_stats:
+        bs = result.block_drop_stats
+        lines.append(f"### {query_num}. Block-Drop Supplement Queries")
+        lines.append("")
+        lines.append(
+            f"Generated by dropping one top-level AND block at a time. "
+            f"Field tightening mode: `{bs.get('field_mode', 'none')}`. "
+            f"Max results cap: {bs.get('max_results', 0):,}."
+        )
+        lines.append("")
+        lines.append(
+            f"- Total queries attempted: {bs.get('queries_total', 0)}"
+        )
+        lines.append(f"- Skipped (exceeded max results): {bs.get('queries_skipped', 0)}")
+        lines.append(f"- Auto-tightened: {bs.get('queries_tightened', 0)}")
+        lines.append(
+            f"- Combined new PMIDs: {bs.get('total_new_pmids', 0):,}, "
+            f"duplicates: {bs.get('total_dup_pmids', 0):,}"
         )
         lines.append("")
 
+        executed_queries = [q for q in bs.get("queries", []) if not q.get("skipped")]
+        if executed_queries:
+            for qi, q in enumerate(executed_queries, 1):
+                rc = q.get('result_count', 0)
+                fetched = q.get('total_pmids', rc)
+                capped_note = ""
+                if rc > fetched:
+                    capped_note = f" (capped from {rc:,} total)"
+                lines.append(
+                    f"**Block-drop query {qi}** — "
+                    f"{fetched:,} PMIDs fetched{capped_note}, "
+                    f"{q.get('new_pmids', 0):,} new "
+                    f"[field: {q.get('field_level', 'none')}]"
+                )
+                lines.append("")
+                lines.append("```")
+                lines.append(q.get('query', ''))
+                lines.append("```")
+                lines.append("")
+        query_num += 1
+
+    # 4. TF-IDF supplement query
+    if result.tfidf_stats:
+        ts = result.tfidf_stats
+        lines.append(f"### {query_num}. TF-IDF Supplement Query")
+        lines.append("")
+        lines.append(
+            f"Built from TF-IDF analysis of {ts.get('docs_used', 0)} seed paper(s). "
+            f"Top {ts.get('terms_used', 0)} of {ts.get('terms_total', 0)} terms selected."
+        )
+        lines.append("")
+        if ts.get("terms"):
+            lines.append(f"- Terms: {', '.join(ts['terms'])}")
+        field = ts.get("field", "tiab")
+        joiner = (ts.get("joiner") or "OR").upper()
+        lines.append(f"- Field restriction: `[{field}]`, joined with {joiner}")
+        tfidf_rc = ts.get("result_count", 0)
+        tfidf_fetched = ts.get("total_pmids", tfidf_rc)
+        tfidf_capped = f" (capped from {tfidf_rc:,} total)" if tfidf_rc > tfidf_fetched else ""
+        lines.append(
+            f"- Results: {tfidf_fetched:,} PMIDs fetched{tfidf_capped} "
+            f"({ts.get('new_pmids', 0):,} new, {ts.get('dup_pmids', 0):,} duplicates)"
+        )
+        if result.tfidf_query:
+            lines.append("")
+            lines.append("```")
+            lines.append(result.tfidf_query)
+            lines.append("```")
+        lines.append("")
+        query_num += 1
+
+    # ── Non-Query Augmentation ──
+    has_non_query_augmentation = any([
+        result.citation_stats, result.similar_stats, result.similar_augment_stats,
+    ])
+    if has_non_query_augmentation:
+        lines.append("## Non-Query Augmentation")
+        lines.append("")
+        lines.append("These PMIDs were added via API lookups, not PubMed queries. "
+                      "To replicate, use the listed seed PMIDs with the respective APIs.")
+        lines.append("")
+
+    # Citation expansion
+    if result.citation_stats:
+        cs = result.citation_stats
+        lines.append("### Citation Expansion (OpenAlex)")
+        lines.append("")
+        lines.append(
+            f"Forward and backward citations were fetched from [OpenAlex](https://openalex.org/) "
+            f"for each seed paper."
+        )
+        lines.append("")
+        lines.append(f"- Depth: {cs.get('depth', 1)}")
+        lines.append(f"- Direction: {cs.get('direction', 'both')}")
+        lines.append(f"- Frontier cap: {cs.get('max_frontier', 0) or 'none'}")
+        lines.append(f"- Seeds queried: {cs.get('seed_with_pmid', 0)}/{cs.get('seed_total', 0)}")
+        if cs.get('seed_doi_resolved'):
+            lines.append(f"- DOI-only seeds resolved to PMID: {cs['seed_doi_resolved']}")
+        lines.append(f"- Total citation PMIDs: {cs['total']:,} ({cs['new']:,} new)")
+        lines.append("")
+        per_seed = cs.get("per_seed", [])
+        if per_seed:
+            lines.append("| Seed | Forward | Backward |")
+            lines.append("|------|--------:|---------:|")
+            for ps in per_seed:
+                lines.append(f"| {ps['id']} | {ps['forward']} | {ps['backward']} |")
+            lines.append("")
+
+    # Similar articles
+    if result.similar_stats:
+        ss = result.similar_stats
+        lines.append("### PubMed Similar Articles")
+        lines.append("")
+        lines.append(
+            f"Fetched via [Entrez elink](https://www.ncbi.nlm.nih.gov/books/NBK25499/#chapter4.ELink) "
+            f"(`dbfrom=pubmed`, `db=pubmed`, `cmd=neighbor_score`)."
+        )
+        lines.append("")
+        lines.append(f"- Per-seed cap: {ss.get('per_seed', 0)}")
+        lines.append(
+            f"- Total: {ss.get('total_pmids', 0):,} PMIDs "
+            f"({ss.get('new_pmids', 0):,} new, {ss.get('dup_pmids', 0):,} duplicates)"
+        )
+        lines.append("")
+        per_seed = ss.get("per_seed_breakdown", [])
+        if per_seed:
+            lines.append("| Seed PMID | Similar articles returned |")
+            lines.append("|-----------|-------------------------:|")
+            for ps in per_seed:
+                lines.append(f"| {ps['seed_pmid']} | {ps['count']} |")
+            lines.append("")
+
+    # Similar articles round 2
     if result.similar_augment_stats:
         sa = result.similar_augment_stats
-        lines.append("### Similar Articles (Round 2)")
+        lines.append("### PubMed Similar Articles (Round 2)")
         lines.append("")
         lines.append(
-            f"- Augmentation pool: {sa.get('augmentation_pool', 0):,} PMIDs, sampled {sa.get('sampled', 0)}"
+            f"Second-round similar articles fetched for PMIDs added by augmentation steps above. "
+            f"{sa.get('sampled', 0)} PMIDs were randomly sampled from a pool of "
+            f"{sa.get('augmentation_pool', 0):,} augmentation-hit PMIDs."
         )
+        lines.append("")
         lines.append(f"- Per-PMID cap: {sa.get('per_pmid', 0)}")
         lines.append(
-            f"- Results: {sa.get('total_pmids', 0):,} total, "
-            f"{sa.get('new_pmids', 0):,} new, {sa.get('dup_pmids', 0):,} duplicates"
+            f"- Total: {sa.get('total_pmids', 0):,} PMIDs "
+            f"({sa.get('new_pmids', 0):,} new, {sa.get('dup_pmids', 0):,} duplicates)"
         )
         lines.append("")
+        sampled_pmids = sa.get("sampled_pmids", [])
+        if sampled_pmids:
+            lines.append("**Sampled PMIDs:**")
+            lines.append("")
+            lines.append(", ".join(str(p) for p in sampled_pmids))
+            lines.append("")
+        per_seed = sa.get("per_seed_breakdown", [])
+        if per_seed:
+            lines.append("| Sampled PMID | Similar articles returned |")
+            lines.append("|--------------|-------------------------:|")
+            for ps in per_seed:
+                lines.append(f"| {ps['seed_pmid']} | {ps['count']} |")
+            lines.append("")
 
     output_path.write_text("\n".join(lines))
 

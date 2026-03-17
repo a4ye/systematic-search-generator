@@ -1,20 +1,20 @@
 # How the Pipeline Works
 
-This document describes the end-to-end approach used by `generate_query.py` to automatically generate and evaluate PubMed search strategies for systematic reviews.
+This document describes the end-to-end approach used by `generate_query.py` to automatically generate PubMed search strategies for systematic reviews.
 
 ## Overview
 
-The pipeline takes a PROSPERO protocol PDF and produces a PubMed Boolean query, then evaluates it against a list of known included studies. Several augmentation layers can be stacked on top of the base query to improve recall without relying on ground truth (no information leakage).
+The pipeline takes a PROSPERO protocol PDF and produces a PubMed Boolean query. Several augmentation layers can be stacked on top of the base query to improve recall. The final result set (all unique PMIDs) is exported as a RIS file for import into reference managers.
 
 ```
-PROSPERO PDF
+PROSPERO PDF + seed PMIDs (optional)
     │
     ▼
 [1] Extract plan (LLM)
     │
     ▼
 [2] Generate Boolean query (LLM, optionally N times)
-    │  ├── seed papers injected into prompt
+    │  ├── seed paper metadata injected into prompt
     │  └── queries OR-merged if N > 1
     │
     ▼
@@ -39,10 +39,10 @@ PROSPERO PDF
 [9] PubMed Similar Articles (Entrez API)
     │
     ▼
-[10] Evaluate against included studies
+[10] Write markdown report + RIS file
 ```
 
-All augmentation steps (5-9) union their results into a single combined result set. Each step uses only the seed papers (known beforehand) — never the full included studies list — so there is no information leakage.
+All augmentation steps (5-9) union their results into a single combined result set.
 
 ## Step-by-step
 
@@ -59,7 +59,7 @@ The extracted plan is combined with a query generation prompt containing 11 inst
 - Avoid overly generic terms that explode result counts
 - Use vocabulary from the literature, not protocol wording
 
-**Seed papers** (`--seeds N`): N randomly selected known relevant papers from the `seed_papers/` cache are appended to the prompt. The LLM is told to use their MeSH terms, keywords, and vocabulary to inform term selection. Fields included are controlled by `--seed-fields` (t=title, a=abstract, m=MeSH, k=keywords).
+**Seed papers** (`--seeds PMID1,PMID2`): Seed paper metadata (title, abstract, MeSH terms, keywords) is fetched from PubMed via the Entrez API and appended to the prompt. The LLM is told to use their MeSH terms, keywords, and vocabulary to inform term selection. Fields included are controlled by `--seed-fields` (t=title, a=abstract, m=MeSH, k=keywords).
 
 **Query ensembling** (`-n N`): The query generation is run N times in parallel. Each run produces a slightly different Boolean query due to LLM sampling. The unique queries are OR-merged into a single union query before execution. This increases vocabulary coverage since different runs emphasize different synonyms.
 
@@ -82,7 +82,7 @@ After the initial query is executed, the pipeline checks which seed papers were 
 3. The supplement query is executed on PubMed and results are merged (union)
 4. This repeats up to `--two-pass-max` times or until all seed papers are captured
 
-This is a closed-loop repair: the system only checks whether its own query retrieves papers it was already shown (the seeds), so no ground truth is used.
+This is a closed-loop repair: the system only checks whether its own query retrieves papers it was already shown (the seeds).
 
 ### 6. Block-drop supplement (`--block-drop`, `--block-drop-max-results`, `--block-drop-field`)
 
@@ -115,28 +115,14 @@ Results are cached locally per PMID so subsequent runs with the same seeds make 
 
 For each seed paper PMID, PubMed's "Similar Articles" feature is queried via the Entrez `elink` API. This returns papers that PubMed considers topically related based on its internal document similarity model. Up to N similar articles per seed are fetched and merged.
 
-### 10. Evaluation
+A second round (`--similar-augment`) can fetch similar articles for PMIDs added by other augmentation steps (two-pass, block-drop, TF-IDF, citations, round-1 similar articles), sampling up to `--similar-augment-sample` PMIDs from the augmentation pool.
 
-The combined result set (base query + all augmentations) is compared against the included studies list. Metrics computed:
+### 10. Output
 
-| Metric | Description |
-|--------|-------------|
-| Recall (overall) | Found / total included studies |
-| Recall (PubMed only) | Found / PubMed-indexed included studies |
-| Precision | Found / total search results |
-| NNR | Number needed to read (1/precision) |
+The pipeline writes two files:
 
-If a human search strategy is available (`.docx` file), the same metrics are computed for it and displayed side-by-side for comparison.
-
-## Information leakage
-
-The search process has **no information leakage**. The included studies list is only used for evaluation (computing recall/precision after the search is complete). All search decisions are based on:
-
-- The PROSPERO protocol (available before any search)
-- Seed papers (a small subset of known relevant papers, available before searching)
-- Citation graphs and PubMed similarity (external data sources, no ground truth)
-
-The `count_found_studies` calls that appear during the pipeline are logging-only — they print progress messages like "Supplement recall: 8->10 (+2)" but never influence which results are added.
+- **Markdown report** (`PREFIX.md`): Contains run settings, all generated queries, augmentation details and statistics, and total result count.
+- **RIS file** (`PREFIX.ris`): Contains one entry per PMID with DOI when available, importable into reference managers.
 
 ## Caching
 
@@ -145,8 +131,6 @@ The pipeline caches aggressively to avoid redundant API calls:
 | Cache | Key | What's stored |
 |-------|-----|---------------|
 | `query_results_cache` | Exact query string | PMIDs, result count, DOI mappings |
-| `pubmed_index_cache` | DOI or PMID | Whether the paper is indexed in PubMed |
 | `citation_cache` | Seed PMID | Forward and backward citation PMID lists |
-| `strategy_cache` | Strategy file path | Extracted human search query |
 
 All caches are JSON files stored in the configured cache directory.

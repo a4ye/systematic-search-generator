@@ -1,6 +1,6 @@
-# Automated Testing Pipeline Usage Guide
+# Usage Guide
 
-This pipeline automates the evaluation of LLM-generated PubMed search queries against human-crafted strategies from systematic reviews.
+This tool generates PubMed systematic review search queries from a PROSPERO protocol PDF, with optional seed papers and multiple augmentation strategies.
 
 ## Setup
 
@@ -15,7 +15,7 @@ uv sync
 Create or edit `.env` in the project root:
 
 ```bash
-# Required for LLM query generation and strategy extraction
+# Required for LLM query generation
 OPENAI_API_KEY=sk-...
 
 # Required for PubMed API (higher rate limits)
@@ -24,226 +24,125 @@ PUBMED_API_KEY=your-ncbi-api-key
 # Email for NCBI Entrez API (required by NCBI)
 ENTREZ_EMAIL=your-email@example.com
 
-# Optional: OpenAlex API (required for higher rate limits)
+# Optional: OpenAlex API (required for --citations)
 OPENALEX_API_KEY=your-openalex-api-key
 
 # Optional: contact email for OpenAlex requests
 OPENALEX_EMAIL=your-email@example.com
 ```
 
-## Commands
-
-### List Available Studies
-
-View all discovered studies and their completeness status:
+## Basic Usage
 
 ```bash
-uv run python -m src.pipeline.runner --list
-```
-
-Output shows:
-- **Complete studies**: Have PROSPERO PDF, Search Strategy, and Included Studies
-- **Incomplete studies**: Missing one or more required files
-
-### Run Single Study
-
-Test one systematic review with detailed output:
-
-```bash
-# Full comparison (LLM vs Human)
-uv run python -m src.pipeline.runner --study 34
-
-# LLM-generated query only
-uv run python -m src.pipeline.runner --study 34 --llm-only
-
-# Human strategy only
-uv run python -m src.pipeline.runner --study 34 --human-only
-```
-
-### Run Multiple Studies
-
-Test specific studies:
-
-```bash
-uv run python -m src.pipeline.runner --studies 34,92,101
-```
-
-### Run All Complete Studies
-
-Batch process all studies that have required files:
-
-```bash
-uv run python -m src.pipeline.runner --all
-```
-
-### Compare Your Own Query
-
-Test a custom PubMed query against a study's included papers:
-
-```bash
-# Evaluate your query against study 34
-uv run python compare_query.py 34
-
-# Also show the human strategy side-by-side
-uv run python compare_query.py 34 --show-human
-```
-
-The script prompts you to paste a PubMed query in the terminal (enter a blank line when done), then runs it against PubMed and displays recall, precision, and NNR.
-
-### Generate Query (Two-Step Prompt)
-
-Generate a PubMed query from a PROSPERO PDF and evaluate it against the human strategy:
-
-```bash
-# Generate, evaluate, and compare against human strategy
-uv run python generate_query.py 34
-
-# Skip human comparison
-uv run python generate_query.py 34 --no-human
+# Generate a query from a PROSPERO PDF
+uv run python -m src.generate_query protocol.pdf
 
 # Extract the systematic review plan only (no query generation)
-uv run python generate_query.py 34 --extract
+uv run python -m src.generate_query protocol.pdf --extract
 
-# Run multiple studies at once (prints per-study tables + summary)
-uv run python generate_query.py 34 35 36
+# Specify output file prefix (generates PREFIX.md and PREFIX.ris)
+uv run python -m src.generate_query protocol.pdf --output results/my_review
 
-# Generate N queries per study and merge PubMed results (union of PMIDs)
-uv run python generate_query.py 34 -n 3
+# Provide seed papers as PMIDs
+uv run python -m src.generate_query protocol.pdf --seeds 12345,67890
 
-# Repeat the prompt twice in a single message for emphasis
-uv run python generate_query.py 34 --double-prompt
-
-# Include 3 random seed papers (from seed_papers/) in the prompt
-uv run python generate_query.py 34 --seeds 3
-
-# Augment results with forward/backward citations of seed papers via OpenAlex
-uv run python generate_query.py 34 --seeds 3 --citations
-
-# Combine options
-uv run python generate_query.py 34 35 -n 3 --double-prompt --seeds 3 --citations --no-human
+# Full example with augmentation
+uv run python -m src.generate_query protocol.pdf \
+  --seeds 12345,67890 \
+  --output results/my_review \
+  -n 3 \
+  --tfidf \
+  --block-drop \
+  --mesh-entry-terms \
+  --citations \
+  --two-pass \
+  --similar 5
 ```
 
-The script runs two LLM calls: first extracting the structured plan from the PDF, then generating a query from that plan. The model and prompts are configured at the top of `generate_query.py` (`MODEL`, `EXTRACT_PROMPT`, `QUERY_PROMPT`).
+## Arguments
+
+### Positional
+
+| Argument | Description |
+|----------|-------------|
+| `prospero_pdf` | Path to the PROSPERO protocol PDF |
+
+### Core Options
 
 | Flag | Description |
 |------|-------------|
-| `-n N` | Run query generation N times per study and merge results (union of PMIDs). LLM calls run in parallel. |
-| `--double-prompt` | Repeat the full query prompt twice in a single message for emphasis. |
-| `--seeds N` | Include N random seed papers (title, abstract, MeSH, keywords) from `seed_papers/` in the prompt. Papers with missing data are skipped. Default 0 (disabled). |
-| `--seed-fields CODES` | Control which seed paper fields to include: `t`=title, `a`=abstract, `m`=MeSH, `k`=keywords. Default `tamk` (all). E.g. `--seed-fields tm` for title + MeSH only. |
-| `--tfidf` | Add a TF-IDF term-mined supplemental query from seed papers (requires `--seeds`). |
+| `--seeds PMIDS` | Comma-separated PMIDs of seed papers (e.g., `--seeds 12345,67890`). Metadata (title, abstract, MeSH, keywords) is fetched from PubMed and included in the LLM prompt. |
+| `--output PREFIX` | Output file prefix. Generates `PREFIX.md` (report) and `PREFIX.ris` (results). Default: `output`. |
+| `--extract` | Extract the systematic review plan only (no query generation). Prints the structured plan and exits. |
+| `-n N` | Run query generation N times and merge results (union of PMIDs). LLM calls run in parallel. Default: 1. |
+| `--double-prompt` | Repeat the query prompt twice in a single message for emphasis. |
+| `--seed-fields CODES` | Control which seed paper fields to include: `t`=title, `a`=abstract, `m`=MeSH, `k`=keywords. Default: `tamk` (all). E.g., `--seed-fields tm` for title + MeSH only. |
+
+### Augmentation Options
+
+| Flag | Description |
+|------|-------------|
+| `--tfidf` | Add a TF-IDF term-mined supplemental query from seed papers. Requires `--seeds`. |
 | `--tfidf-top N` | Number of TF-IDF terms to include (default: 8). |
-| `--tfidf-max-results N` | Maximum PubMed results allowed for the TF-IDF supplemental query (default: 20000). |
-| `--block-drop` | Add block-drop supplemental queries by removing one top-level AND block. |
-| `--block-drop-max-results N` | Maximum PubMed results allowed for block-drop queries (default: 20000). |
-| `--block-drop-field MODE` | Field-tightening mode for block-drop queries: `none`, `ti`, `majr`, `ti+majr` (default: `ti`). |
-| `--citations` | Augment query results with forward/backward citations of seed papers via the OpenAlex API. Requires `--seeds`. Unions citation PMIDs with Boolean query PMIDs before evaluation. |
-| `--citation-depth N` | Citation expansion depth (1 = direct citations only). |
-| `--citation-direction {both,forward,backward}` | Citation direction to follow (default: both). |
-| `--citation-max-frontier N` | Cap number of works expanded at each depth (0 = no cap). |
-| `--two-pass` | Generate a supplementary query for missed seed papers and merge results. |
-| `--two-pass-max N` | Maximum number of supplementary passes to run (default: 3). |
-| `--mesh-entry-terms` | Expand MeSH terms with entry-term free-text variants. |
-| `--mesh-entry-max N` | Maximum number of entry terms per MeSH heading (default: 6). |
-| `--similar N` | Fetch up to N PubMed "Similar Articles" per seed paper and merge results (0 = disabled). |
-| `--similar-augment N` | Second-round similar articles: fetch up to N per augmentation-hit PMID (0 = disabled). Runs on PMIDs added by two-pass, block-drop, TF-IDF, citations, and round-1 similar articles. |
-| `--similar-augment-sample N` | Max augmentation-hit PMIDs to sample for second-round similar articles (default: 10). |
-| `--show-missed` | Append a "Missed Papers" section to the results file listing PubMed-indexed papers not captured by the query, with title, abstract, MeSH terms, and keywords (enriched from `seed_papers/` cache). |
-| `--save-prompt` | Append the full composed LLM prompt to the results file. |
-| `--no-human` | Skip human strategy comparison. |
-| `--extract` | Extract the systematic review plan only (no query generation). |
-
-When multiple studies are provided, a summary table is printed at the end with aggregate recall, precision, NNR, and human baseline columns.
-
-### Additional Options
-
-| Flag | Description |
-|------|-------------|
-| `--llm-only` | Skip human strategy evaluation |
-| `--human-only` | Skip LLM query generation |
-| `--refresh-cache` | Force re-extraction of human strategies (ignore cache) |
-| `--output PATH` | Custom output directory for reports |
+| `--tfidf-max-results N` | Max PubMed results for the TF-IDF supplemental query (default: 20000). |
+| `--block-drop` | Add block-drop supplemental queries by removing one top-level AND block at a time. |
+| `--block-drop-max-results N` | Max PubMed results for block-drop queries (default: 20000). |
+| `--block-drop-field MODE` | Field tightening for block-drop: `none`, `ti`, `majr`, `ti+majr` (default: `ti`). |
+| `--two-pass` | Generate supplementary queries for seed papers missed by the primary query. |
+| `--two-pass-max N` | Max number of supplementary passes (default: 3). |
+| `--mesh-entry-terms` | Expand MeSH terms in the query with entry-term free-text variants. |
+| `--mesh-entry-max N` | Max entry terms per MeSH heading (default: 6). |
+| `--citations` | Augment results with forward/backward citations of seed papers via OpenAlex. |
+| `--citation-depth N` | Citation expansion depth (default: 1). |
+| `--citation-direction DIR` | Citation direction: `both`, `forward`, or `backward` (default: `both`). |
+| `--citation-max-frontier N` | Cap works expanded per depth, 0 = no cap (default: 0). |
+| `--similar N` | Fetch up to N PubMed "Similar Articles" per seed paper (0 = disabled). |
+| `--similar-augment N` | Second-round similar articles per augmentation-hit PMID (0 = disabled). |
+| `--similar-augment-sample N` | Max augmentation-hit PMIDs to sample for round 2 (default: 10). |
 
 ## Output
 
-### Single Study Mode
+The tool produces two output files:
 
-Displays a detailed comparison table:
+### Markdown Report (`PREFIX.md`)
+
+Contains:
+- Run settings (model, flags, seed PMIDs)
+- Primary query (the merged Boolean query sent to PubMed)
+- Individual LLM-generated queries (when `-n > 1`)
+- Augmentation details:
+  - Two-pass supplement queries and pass-by-pass PMID counts
+  - Block-drop variant queries and result counts
+  - TF-IDF supplemental query and terms
+  - Citation expansion stats (depth, direction, PMIDs found)
+  - Similar articles stats (per-seed counts, new/duplicate)
+- Result summary with total PMID count
+
+### RIS File (`PREFIX.ris`)
+
+Contains one entry per PMID with DOI when available:
 
 ```
-Study: 34 - Lu 2022
-────────────────────────────────────────────────────────────
-┏━━━━━━━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━┓
-┃ Metric           ┃   LLM ┃ Human ┃
-┡━━━━━━━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━┩
-│ Results          │   410 │  3656 │
-│ Recall (overall) │ 75.0% │ 83.3% │
-│ Recall (PubMed)  │ 90.0% │100.0% │
-│ Precision        │  2.2% │  0.3% │
-│ NNR              │  45.6 │ 304.7 │
-│ Found / Total    │  9/12 │ 10/12 │
-└──────────────────┴───────┴───────┘
-Winner: LLM
+TY  - JOUR
+ID  - 12345678
+DO  - 10.1234/example
+ER  -
 ```
 
-### Batch Mode
-
-Generates:
-- Console summary table
-- `results/comparison_report.md` - Detailed markdown report
-- `results/comparison_results.csv` - CSV for further analysis
-
-## Metrics Explained
-
-| Metric | Description |
-|--------|-------------|
-| **Results** | Total papers returned by the search query |
-| **Recall (overall)** | % of included studies found by the search |
-| **Recall (PubMed)** | % of PubMed-indexed included studies found |
-| **Precision** | % of search results that are included studies |
-| **NNR** | Number Needed to Read (results per included study found) |
-| **F1 Score** | Harmonic mean of precision and recall |
+This file can be imported into reference managers (Zotero, EndNote, Mendeley, etc.) for screening.
 
 ## Caching
 
-Human search strategies extracted from `.docx` files are cached in `.cache/human_strategies.json` to avoid redundant API calls. The cache is automatically invalidated if the source file changes.
+PubMed query results are cached locally to avoid redundant API calls:
 
-To force re-extraction:
+| Cache | Key | What's stored |
+|-------|-----|---------------|
+| `query_results_cache` | Exact query string | PMIDs, result count, DOI mappings |
+| `citation_cache` | Seed PMID | Forward and backward citation PMID lists |
 
-```bash
-uv run python -m src.pipeline.runner --study 34 --refresh-cache
-```
+All caches are JSON files stored in the configured cache directory (default: `.cache/`).
 
-## Data Directory Structure
-
-The pipeline expects studies in `data/` with this naming pattern:
-
-```
-data/
-├── 34 - Lu 2022/
-│   ├── PROSPERO.pdf              # or *PROSPERO*.pdf, Protocol.pdf
-│   ├── Search Strategy.docx      # or *Search*Strateg*.docx
-│   └── Included Studies.xlsx     # or *Included*Stud*.xlsx
-├── 92 - Pitesa 2025/
-│   └── ...
-```
-
-File names are matched using fuzzy patterns, so variations like `Lu 2022 PROSPERO.pdf` or `Included Studies - Lu 2022.xlsx` work automatically.
-
-## Troubleshooting
-
-### "OPENAI_API_KEY is not set"
-
-Add your OpenAI API key to `.env`:
-```bash
-OPENAI_API_KEY=sk-proj-...
-```
-
-### "Missing PROSPERO PDF"
-
-The study directory doesn't contain a file matching `*PROSPERO*.pdf`, `*Protocol*.pdf`, or `CRD*.pdf`.
-
-### Rate Limiting
+## Rate Limits
 
 The pipeline respects PubMed rate limits:
 - Without API key: 3 requests/second

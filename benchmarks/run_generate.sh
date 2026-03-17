@@ -8,10 +8,8 @@ fi
 
 uv run python -m src.generate_query "$@" \
   -n 5 \
-  --seeds 5 \
-  --save-prompt \
+  --seeds 23406311,16919107,31826369,31309323,24472587 \
   --seed-fields tm \
-  --show-missed \
   --citations \
   --citation-depth 1 \
   --two-pass \
