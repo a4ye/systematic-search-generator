@@ -1612,7 +1612,7 @@ def run_pipeline(
         executed_query=final_query,
         final_pmid_map=dict(llm_results.pmid_map),
         final_doi_map=dict(llm_results.doi_map),
-        total_result_count=llm_results.result_count,
+        total_result_count=len(llm_results.pmid_map),
         base_result_count=base_result_count,
         base_total_count=base_total_count,
         max_pubmed_results=config.max_pubmed_results,
