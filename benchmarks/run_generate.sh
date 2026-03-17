@@ -6,7 +6,7 @@ if [[ "$#" -lt 1 ]]; then
   exit 1
 fi
 
-uv run python generate_query.py "$@" \
+uv run python -m src.generate_query "$@" \
   -n 5 \
   --seeds 5 \
   --save-prompt \

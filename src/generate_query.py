@@ -119,7 +119,7 @@ Important:
 """
 
 SEED_PAPERS_DIR = Path("seed_papers")
-SPLASH_FILE = Path("splash_messages.txt")
+
 
 
 def load_seed_papers(study_id: str, study_name: str, n: int) -> list[dict] | None:
@@ -186,26 +186,6 @@ def format_seed_papers(papers: list[dict], fields: str = "tamk") -> str:
         lines.append("")
     return "\n".join(lines)
 
-
-def load_splash_text() -> str:
-    """Load a random splash message from the splash text file."""
-    try:
-        lines = [l.strip() for l in SPLASH_FILE.read_text().splitlines()]
-        choices = [l for l in lines if l and not l.startswith("#")]
-        if choices:
-            return random.choice(choices)
-    except Exception:
-        pass
-    return "Crunching citations..."
-
-
-def load_splash_messages() -> list[str]:
-    """Load all splash messages from file."""
-    try:
-        lines = [l.strip() for l in SPLASH_FILE.read_text().splitlines()]
-        return [l for l in lines if l and not l.startswith("#")]
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -1127,39 +1107,9 @@ def run_study(
         args.two_pass_max,
     )
 
-    splash_messages = load_splash_messages()
-    if not splash_messages:
-        splash_messages = [load_splash_text()]
-    splash_colors = ["bright_magenta", "bright_cyan", "bright_green", "bright_yellow", "bright_blue"]
-    last_splash_change = time.time()
-    splash_interval = random.uniform(5, 10)
-    splash_index = 0
-    color_index = 0
-
-    def _shimmer_text(text: str, offset: int = 0) -> str:
-        if not text:
-            return text
-        parts = []
-        for i, ch in enumerate(text):
-            color = splash_colors[(i + offset) % len(splash_colors)]
-            parts.append(f"[bold {color}]{ch}[/]")
-        return "".join(parts)
-
-    def maybe_rotate_splash() -> str:
-        nonlocal last_splash_change, splash_interval, splash_index, color_index
-        now = time.time()
-        if now - last_splash_change >= splash_interval:
-            last_splash_change = now
-            splash_interval = random.uniform(5, 10)
-            splash_index = (splash_index + 1) % len(splash_messages)
-        msg = splash_messages[splash_index]
-        color_index = (color_index + 1) % len(splash_colors)
-        return _shimmer_text(msg, color_index)
-
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        TextColumn("[dim]{task.fields[splash]}[/dim]"),
         BarColumn(bar_width=25),
         TextColumn("{task.completed}/{task.total}"),
         TimeElapsedColumn(),
@@ -1172,12 +1122,12 @@ def run_study(
         task_id = progress.add_task(
             "Loading included studies...",
             total=total_steps,
-            splash=maybe_rotate_splash(),
+
         )
         log = progress.console
         progress.refresh()
         def step(description: str) -> None:
-            progress.update(task_id, description=description, advance=1, splash=maybe_rotate_splash())
+            progress.update(task_id, description=description, advance=1)
 
         # Load included studies
         included_result = extract_included_studies(str(study.included_studies_xlsx))
@@ -1190,7 +1140,7 @@ def run_study(
         log.print(f"Included studies: {len(included_studies)}")
 
         # Step 1: Extract plan from PROSPERO PDF
-        progress.update(task_id, description=f"Extracting plan with {MODEL}...", splash=maybe_rotate_splash())
+        progress.update(task_id, description=f"Extracting plan with {MODEL}...")
         extract_response = client.generate_with_file(prompt=EXTRACT_PROMPT, file_path=study.prospero_pdf)
         step("Extracted plan")
         plan_info = extract_response.content
@@ -1203,7 +1153,7 @@ def run_study(
         seed_section = ""
         seed_papers = None
         if args.seeds > 0:
-            progress.update(task_id, description="Loading seed papers...", splash=maybe_rotate_splash())
+            progress.update(task_id, description="Loading seed papers...")
             seed_papers = load_seed_papers(study.study_id, study.name, args.seeds)
             if seed_papers:
                 seed_section = "\n\n" + format_seed_papers(seed_papers, fields=args.seed_fields)
@@ -1238,7 +1188,7 @@ def run_study(
             return run_i, q, resp.prompt_tokens, resp.completion_tokens, resp.generation_time
 
         if n_runs == 1:
-            progress.update(task_id, description="Generating query...", splash=maybe_rotate_splash())
+            progress.update(task_id, description="Generating query...")
             _, q, pt, ct, gt = _generate_one(0)
             step("Generated query")
             generated_queries = [q]
@@ -1272,7 +1222,7 @@ def run_study(
                     progress.update(
                         task_id,
                         description=description,
-                        splash=maybe_rotate_splash(),
+            
                     )
 
             cached_result = query_cache.get(query)
@@ -1297,7 +1247,7 @@ def run_study(
                 progress.update(
                     task_id,
                     description=f"{label}: counting results...",
-                    splash=maybe_rotate_splash(),
+        
                 )
             result_count = known_count if known_count is not None else pubmed.count_results(query)
             if result_count > max_count:
@@ -1307,8 +1257,7 @@ def run_study(
                 maybe_step(f"{label}: too broad")
                 return None
 
-            progress.update(task_id, description=f"{label}: fetching {result_count:,} results...",
-                            splash=maybe_rotate_splash())
+            progress.update(task_id, description=f"{label}: fetching {result_count:,} results...")
             batch_task_id = None
 
             def _batch_progress(done: int, total: int) -> None:
@@ -1319,9 +1268,9 @@ def run_study(
                     batch_task_id = progress.add_task(
                         f"{label}: batches",
                         total=total,
-                        splash=maybe_rotate_splash(),
+            
                     )
-                progress.update(batch_task_id, completed=done, splash=maybe_rotate_splash())
+                progress.update(batch_task_id, completed=done)
 
             search_results = pubmed.execute_query_fast(
                 query,
@@ -1448,7 +1397,7 @@ def run_study(
                     progress.update(
                         task_id,
                         description=f"Generating supplement query {passes_run}...",
-                        splash=maybe_rotate_splash(),
+            
                     )
                     resp = client.generate_text(prompt=supplement_prompt)
                     supplement_query = extract_query_from_response(resp.content)
@@ -1586,7 +1535,7 @@ def run_study(
                     progress.update(
                         task_id,
                         description=f"{label}: counting results...",
-                        splash=maybe_rotate_splash(),
+            
                     )
 
                     # Try each tightening level until one fits under max_results
@@ -1733,7 +1682,7 @@ def run_study(
                             progress.update(
                                 task_id,
                                 description=f"TF-IDF query: counting results ({attempt} terms, {field})...",
-                                splash=maybe_rotate_splash(),
+                    
                             )
                             count = pubmed.count_results(candidate_query)
                         last_count = count
@@ -1770,7 +1719,7 @@ def run_study(
                             progress.update(
                                 task_id,
                                 description="TF-IDF query: tightening with AND (title-only)...",
-                                splash=maybe_rotate_splash(),
+                    
                             )
                             strict_count = pubmed.count_results(strict_query)
                     if strict_query and strict_count is not None and strict_count <= max_count:
@@ -1864,7 +1813,7 @@ def run_study(
                         seed_no_id.append(sp.get("title") or "unknown title")
                         continue
                     if sp_pmid:
-                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
                         cr = oa_client.get_citations(
                             sp_pmid,
                             cache=citation_cache,
@@ -1879,7 +1828,7 @@ def run_study(
                         )
                     else:
                         # DOI-only seed: look up via DOI
-                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
+                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...")
                         cr, resolved_pmid = oa_client.get_citations_by_doi(
                             sp_doi,
                             cache=citation_cache,
@@ -1910,7 +1859,7 @@ def run_study(
                         seed_no_id.append(sp.get("title") or "unknown title")
                         continue
                     if sp_pmid:
-                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...", splash=maybe_rotate_splash())
+                        progress.update(task_id, description=f"Citations for PMID {sp_pmid}...")
                         cr, work_ids, found = oa_client.get_citations_with_work_ids(
                             sp_pmid,
                             cache=citation_cache,
@@ -1929,7 +1878,7 @@ def run_study(
                         )
                     else:
                         # DOI-only seed: look up via DOI
-                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...", splash=maybe_rotate_splash())
+                        progress.update(task_id, description=f"Citations for DOI {sp_doi}...")
                         cr, work_ids, found, resolved_pmid = oa_client.get_citations_with_work_ids_by_doi(
                             sp_doi,
                             cache=citation_cache,
@@ -1957,7 +1906,7 @@ def run_study(
                 for level in range(2, depth + 1):
                     if not frontier_ids:
                         break
-                    progress.update(task_id, description=f"Citations depth {level}...", splash=maybe_rotate_splash())
+                    progress.update(task_id, description=f"Citations depth {level}...")
                     next_frontier: set[str] = set()
                     frontier_list = sorted(frontier_ids)
                     if max_frontier > 0 and len(frontier_list) > max_frontier:
@@ -2092,7 +2041,7 @@ def run_study(
             if seed_pmids:
                 found_before = count_found_studies(llm_results, eval_included_studies)
                 total_included = len(eval_included_studies)
-                progress.update(task_id, description="Fetching similar articles...", splash=maybe_rotate_splash())
+                progress.update(task_id, description="Fetching similar articles...")
                 similar_map = fetch_similar_pmids(
                     seed_pmids,
                     email=config.entrez_email,
@@ -2162,7 +2111,7 @@ def run_study(
 
                 found_before = count_found_studies(llm_results, eval_included_studies)
                 total_included = len(eval_included_studies)
-                progress.update(task_id, description="Fetching similar articles (round 2)...", splash=maybe_rotate_splash())
+                progress.update(task_id, description="Fetching similar articles (round 2)...")
                 aug_similar_map = fetch_similar_pmids(
                     sampled,
                     email=config.entrez_email,
